@@ -1,0 +1,14 @@
+# Docker 忽略文件
+.git
+.gitignore
+.env
+.venv
+__pycache__
+*.pyc
+debug/
+logs/
+*.log
+rust-proxy/target/
+!rust-proxy/target/release/warp-rustls-proxy
+node_modules
+.DS_Store

@@ -6,6 +6,7 @@ Protobuf utility functions
 Shared functions for protobuf encoding/decoding across the application.
 """
 from typing import Any, Dict
+import base64 as _b64
 from fastapi import HTTPException
 from .logging import logger
 from .protobuf import ensure_proto_runtime, msg_cls
@@ -261,6 +262,12 @@ def _populate_protobuf_from_dict(proto_msg, data_dict: Dict, path: str = "$"):
                             except Exception:
                                 pass
                         # 其余情况直接赋值，若类型不匹配由底层抛错
+                    # 处理 bytes 字段：base64 字符串 → Python bytes
+                    if fd is not None and fd.type == _FD.TYPE_BYTES and isinstance(value, str):
+                        try:
+                            value = _b64.b64decode(value)
+                        except Exception:
+                            logger.warning(f"base64 解码 bytes 字段 {current_path} 失败，尝试原值")
                     setattr(proto_msg, key, value)
                 except Exception as e:
                     logger.warning(f"设置字段 {current_path} 失败: {e}")

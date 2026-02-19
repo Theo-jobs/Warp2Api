@@ -15,7 +15,7 @@ import httpx
 import asyncio
 from dotenv import load_dotenv, set_key
 
-from ..config.settings import REFRESH_TOKEN_B64, REFRESH_URL, CLIENT_VERSION, OS_CATEGORY, OS_NAME, OS_VERSION
+from ..config.settings import REFRESH_TOKEN_B64, REFRESH_URL, CLIENT_ID, CLIENT_VERSION, OS_CATEGORY, OS_NAME, OS_VERSION
 from .logging import logger, log
 
 
@@ -61,6 +61,7 @@ async def refresh_jwt_token() -> dict:
     else:
         payload = base64.b64decode(REFRESH_TOKEN_B64)
     headers = {
+        "x-warp-client-id": CLIENT_ID,
         "x-warp-client-version": CLIENT_VERSION,
         "x-warp-os-category": OS_CATEGORY,
         "x-warp-os-name": OS_NAME,
@@ -206,6 +207,7 @@ async def _create_anonymous_user() -> dict:
     headers = {
         "accept-encoding": "gzip, br",
         "content-type": "application/json",
+        "x-warp-client-id": CLIENT_ID,
         "x-warp-client-version": CLIENT_VERSION,
         "x-warp-os-category": OS_CATEGORY,
         "x-warp-os-name": OS_NAME,
@@ -238,7 +240,7 @@ async def _create_anonymous_user() -> dict:
             "referralCode": None
         },
         "requestContext": {
-            "clientContext": {"version": CLIENT_VERSION},
+            "clientContext": {"id": CLIENT_ID, "version": CLIENT_VERSION},
             "osContext": {
                 "category": OS_CATEGORY,
                 "linuxKernelVersion": None,
@@ -262,6 +264,7 @@ async def _exchange_id_token_for_refresh_token(id_token: str) -> dict:
     headers = {
         "accept-encoding": "gzip, br",
         "content-type": "application/x-www-form-urlencoded",
+        "x-warp-client-id": CLIENT_ID,
         "x-warp-client-version": CLIENT_VERSION,
         "x-warp-os-category": OS_CATEGORY,
         "x-warp-os-name": OS_NAME,
@@ -304,6 +307,7 @@ async def acquire_anonymous_access_token() -> str:
     # Now call Warp proxy token endpoint to get access_token using this refresh token
     payload = f"grant_type=refresh_token&refresh_token={refresh_token}".encode("utf-8")
     headers = {
+        "x-warp-client-id": CLIENT_ID,
         "x-warp-client-version": CLIENT_VERSION,
         "x-warp-os-category": OS_CATEGORY,
         "x-warp-os-name": OS_NAME,

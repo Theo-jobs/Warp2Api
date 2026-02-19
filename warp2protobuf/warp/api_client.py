@@ -16,7 +16,7 @@ import socket
 from ..core.logging import logger
 from ..core.protobuf_utils import protobuf_to_dict
 from ..core.auth import get_valid_jwt, acquire_anonymous_access_token
-from ..config.settings import WARP_URL as CONFIG_WARP_URL
+from ..config.settings import WARP_URL as CONFIG_WARP_URL, CLIENT_ID, CLIENT_VERSION, OS_CATEGORY, OS_NAME, OS_VERSION
 
 
 def _get(d: Dict[str, Any], *names: str) -> Any:
@@ -89,11 +89,12 @@ async def send_protobuf_to_warp_api(
                 jwt = await get_valid_jwt() if attempt == 0 else jwt  # keep existing unless refreshed explicitly
                 headers = {
                     "accept": "text/event-stream",
-                    "content-type": "application/x-protobuf", 
-                    "x-warp-client-version": "v0.2025.08.06.08.12.stable_02",
-                    "x-warp-os-category": "Windows",
-                    "x-warp-os-name": "Windows", 
-                    "x-warp-os-version": "11 (26100)",
+                    "content-type": "application/x-protobuf",
+                    "x-warp-client-id": CLIENT_ID,
+                    "x-warp-client-version": CLIENT_VERSION,
+                    "x-warp-os-category": OS_CATEGORY,
+                    "x-warp-os-name": OS_NAME,
+                    "x-warp-os-version": OS_VERSION,
                     "authorization": f"Bearer {jwt}",
                     "content-length": str(len(protobuf_bytes)),
                 }
@@ -273,11 +274,12 @@ async def send_protobuf_to_warp_api_parsed(protobuf_bytes: bytes) -> tuple[str, 
                 jwt = await get_valid_jwt() if attempt == 0 else jwt  # keep existing unless refreshed explicitly
                 headers = {
                     "accept": "text/event-stream",
-                    "content-type": "application/x-protobuf", 
-                    "x-warp-client-version": "v0.2025.08.06.08.12.stable_02",
-                    "x-warp-os-category": "Windows",
-                    "x-warp-os-name": "Windows", 
-                    "x-warp-os-version": "11 (26100)",
+                    "content-type": "application/x-protobuf",
+                    "x-warp-client-id": CLIENT_ID,
+                    "x-warp-client-version": CLIENT_VERSION,
+                    "x-warp-os-category": OS_CATEGORY,
+                    "x-warp-os-name": OS_NAME,
+                    "x-warp-os-version": OS_VERSION,
                     "authorization": f"Bearer {jwt}",
                     "content-length": str(len(protobuf_bytes)),
                 }

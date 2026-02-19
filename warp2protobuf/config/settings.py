@@ -18,7 +18,14 @@ PROTO_DIR = SCRIPT_DIR / "proto"
 LOGS_DIR = SCRIPT_DIR / "logs"
 
 # API configuration
-WARP_URL = "https://app.warp.dev/ai/multi-agent"
+# When WARP_RUSTLS_PROXY is set (default), route through the local Rust proxy
+# which uses rustls for TLS — matching Warp client's TLS fingerprint to bypass 403.
+# Set WARP_URL directly to override, or WARP_RUSTLS_PROXY=0 to disable.
+_rustls_proxy_port = os.getenv("RUST_PROXY_PORT", "28887")
+_rustls_proxy_enabled = os.getenv("WARP_RUSTLS_PROXY", "1").lower() not in ("0", "false", "no")
+_direct_warp_url = "https://app.warp.dev/ai/multi-agent"
+_proxy_warp_url = f"http://127.0.0.1:{_rustls_proxy_port}/ai/multi-agent"
+WARP_URL = os.getenv("WARP_URL", _proxy_warp_url if _rustls_proxy_enabled else _direct_warp_url)
 
 # Environment variables with defaults
 HOST = os.getenv("HOST", "0.0.0.0")
@@ -26,10 +33,11 @@ PORT = int(os.getenv("PORT", "8002"))
 WARP_JWT = os.getenv("WARP_JWT")
 
 # Client headers configuration
-CLIENT_VERSION = "v0.2025.08.06.08.12.stable_02"
-OS_CATEGORY = "Windows"
-OS_NAME = "Windows"
-OS_VERSION = "11 (26100)"
+CLIENT_ID = os.getenv("WARP_CLIENT_ID", "warp-app")
+CLIENT_VERSION = os.getenv("WARP_CLIENT_VERSION", "v0.2026.02.11.08.23.stable_01")
+OS_CATEGORY = os.getenv("WARP_OS_CATEGORY", "macOS")
+OS_NAME = os.getenv("WARP_OS_NAME", "macOS")
+OS_VERSION = os.getenv("WARP_OS_VERSION", "26.3")
 
 # Protobuf field names for text detection
 TEXT_FIELD_NAMES = ("text", "prompt", "query", "content", "message", "input")

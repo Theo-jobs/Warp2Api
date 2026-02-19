@@ -22,7 +22,7 @@ from ..core.protobuf_utils import protobuf_to_dict, dict_to_protobuf_bytes
 from ..core.auth import get_jwt_token, refresh_jwt_if_needed, is_token_expired, get_valid_jwt, acquire_anonymous_access_token
 from ..core.stream_processor import get_stream_processor, set_websocket_manager
 from ..config.models import get_all_unique_models
-from ..config.settings import CLIENT_VERSION, OS_CATEGORY, OS_NAME, OS_VERSION, WARP_URL as CONFIG_WARP_URL
+from ..config.settings import CLIENT_ID, CLIENT_VERSION, OS_CATEGORY, OS_NAME, OS_VERSION, WARP_URL as CONFIG_WARP_URL
 from ..core.server_message_data import decode_server_message_data, encode_server_message_data
 
 
@@ -500,6 +500,7 @@ async def send_to_warp_api_stream_sse(request: EncodeRequest):
                     headers = {
                         "accept": "text/event-stream",
                         "content-type": "application/x-protobuf",
+                        "x-warp-client-id": CLIENT_ID,
                         "x-warp-client-version": CLIENT_VERSION,
                         "x-warp-os-category": OS_CATEGORY,
                         "x-warp-os-name": OS_NAME,

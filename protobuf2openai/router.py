@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -15,15 +16,71 @@ from .logging import logger
 from .models import ChatCompletionsRequest, ChatMessage
 from .reorder import reorder_messages_for_anthropic
 from .helpers import normalize_content_to_list, segments_to_text
-from .packets import packet_template, map_history_to_warp_messages, attach_user_and_tools_to_inputs
+from .packets import packet_template, attach_user_and_tools_to_inputs
 from .state import STATE
 from .config import BRIDGE_BASE_URL
 from .bridge import initialize_once
 from .sse_transform import stream_openai_sse
 from .auth import authenticate_request
 
+from warp2protobuf.config.models import resolve_model, get_all_unique_models as _get_all_models
 
 router = APIRouter()
+
+
+def _extract_http_status_from_error_text(error_text: str) -> Optional[int]:
+    """Extract upstream HTTP status from canonical bridge error text."""
+    if not error_text:
+        return None
+    match = re.search(r"Warp\s+API\s+Error\s*\(HTTP\s+([1-5]\d{2})\)", error_text, re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        status_code = int(match.group(1))
+    except ValueError:
+        return None
+    if 100 <= status_code <= 599:
+        return status_code
+    return None
+
+
+def _serialize_history_to_text(history: List[ChatMessage]) -> Optional[str]:
+    """将多轮对话历史序列化为文本，用于注入 system prompt。
+
+    跳过 system 消息和最后一条 user/tool 输入（它会作为当前 query 发送）。
+    """
+    non_system = [m for m in history if m.role != "system"]
+    if len(non_system) <= 1:
+        return None  # 没有历史
+
+    # 最后一条 user/tool 是当前输入，不放入历史
+    history_msgs = non_system[:-1]
+    if not history_msgs:
+        return None
+
+    lines: List[str] = []
+    for m in history_msgs:
+        text = segments_to_text(normalize_content_to_list(m.content))
+        if m.role == "user":
+            lines.append(f"User: {text}")
+        elif m.role == "assistant":
+            if text:
+                lines.append(f"Assistant: {text}")
+            for tc in (m.tool_calls or []):
+                fn = (tc.get("function") or {})
+                tc_name = fn.get("name", "unknown")
+                tc_args = fn.get("arguments", "{}")
+                lines.append(f"Assistant: [called tool: {tc_name}({tc_args})]")
+        elif m.role == "tool":
+            lines.append(f"Tool result ({m.tool_call_id or 'unknown'}): {text[:500]}")
+    if not lines:
+        return None
+    return (
+        "[Previous conversation]\n"
+        + "\n".join(lines)
+        + "\n[End of previous conversation]\n\n"
+        + "Continue the conversation naturally based on the above context."
+    )
 
 
 @router.get("/")
@@ -38,20 +95,8 @@ def health_check():
 
 @router.get("/v1/models")
 def list_models():
-    """OpenAI-compatible model listing. Forwards to bridge, with local fallback."""
-    try:
-        resp = requests.get(f"{BRIDGE_BASE_URL}/v1/models", timeout=10.0)
-        if resp.status_code != 200:
-            raise HTTPException(resp.status_code, f"bridge_error: {resp.text}")
-        return resp.json()
-    except Exception as e:
-        try:
-            # Local fallback: construct models directly if bridge is unreachable
-            from warp2protobuf.config.models import get_all_unique_models  # type: ignore
-            models = get_all_unique_models()
-            return {"object": "list", "data": models}
-        except Exception:
-            raise HTTPException(502, f"bridge_unreachable: {e}")
+    """OpenAI-compatible model listing — 直接返回本地模型目录。"""
+    return {"object": "list", "data": _get_all_models()}
 
 
 @router.post("/v1/chat/completions")
@@ -99,23 +144,24 @@ async def chat_completions(req: ChatCompletionsRequest, request: Request = None)
     except Exception:
         system_prompt_text = None
 
-    task_id = STATE.baseline_task_id or str(uuid.uuid4())
+    task_id = str(uuid.uuid4())
     packet = packet_template()
-    packet["task_context"] = {
-        "tasks": [{
-            "id": task_id,
-            "description": "",
-            "status": {"in_progress": {}},
-            "messages": map_history_to_warp_messages(history, task_id, None, False),
-        }],
-        "active_task_id": task_id,
-    }
+
+    # 多轮对话：将历史序列化为文本注入 system prompt（T4 方案）
+    # 每次都当新会话处理，空 task_context，完全无状态
+    history_text = _serialize_history_to_text(history)
+    if history_text:
+        if system_prompt_text:
+            system_prompt_text = system_prompt_text + "\n\n" + history_text
+        else:
+            system_prompt_text = history_text
+
+    packet["task_context"] = {}
 
     packet.setdefault("settings", {}).setdefault("model_config", {})
-    packet["settings"]["model_config"]["base"] = req.model or packet["settings"]["model_config"].get("base") or "claude-4.1-opus"
-
-    if STATE.conversation_id:
-        packet.setdefault("metadata", {})["conversation_id"] = STATE.conversation_id
+    resolved = resolve_model(req.model)
+    packet["settings"]["model_config"]["base"] = resolved
+    logger.info("[OpenAI Compat] 模型映射: %s → %s", req.model, resolved)
 
     attach_user_and_tools_to_inputs(packet, history, system_prompt_text)
 
@@ -211,6 +257,9 @@ async def chat_completions(req: ChatCompletionsRequest, request: Request = None)
         finish_reason = "tool_calls"
     else:
         response_text = bridge_resp.get("response", "")
+        status_code = _extract_http_status_from_error_text(response_text)
+        if status_code in {401, 403, 429, 500, 502, 503, 504}:
+            raise HTTPException(status_code=status_code, detail=response_text)
         msg_payload = {"role": "assistant", "content": response_text}
         finish_reason = "stop"
 

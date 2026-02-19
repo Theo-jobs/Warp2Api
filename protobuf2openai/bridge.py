@@ -49,9 +49,14 @@ def bridge_send_stream(packet: Dict[str, Any]) -> Dict[str, Any]:
     raise Exception("bridge_unreachable")
 
 
+_warmup_attempted = False
+
+
 def initialize_once() -> None:
-    if STATE.conversation_id:
+    global _warmup_attempted
+    if _warmup_attempted or STATE.conversation_id:
         return
+    _warmup_attempted = True
 
     ensure_tool_ids()
 

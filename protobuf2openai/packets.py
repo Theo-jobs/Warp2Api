@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 import json
 
 from .state import STATE, ensure_tool_ids
-from .helpers import normalize_content_to_list, segments_to_text, segments_to_warp_results
+from .helpers import normalize_content_to_list, segments_to_text, segments_to_warp_results, extract_images_from_segments
 from .models import ChatMessage
 
 
@@ -30,7 +30,7 @@ def packet_template() -> Dict[str, Any]:
             "should_preserve_file_content_in_history": False,
             "supports_todos_ui": False,
             "supports_linked_code_blocks": False,
-            "supported_tools": [9],
+            "supported_tools": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
         },
         "metadata": {"logging": {"is_autodetected_user_query": True, "entrypoint": "USER_INITIATED"}},
     }
@@ -108,7 +108,8 @@ def attach_user_and_tools_to_inputs(packet: Dict[str, Any], history: List[ChatMe
         assert False, "post-reorder 必须至少包含一条消息"
     last = history[-1]
     if last.role == "user":
-        user_query_payload: Dict[str, Any] = {"query": segments_to_text(normalize_content_to_list(last.content))}
+        segments = normalize_content_to_list(last.content)
+        user_query_payload: Dict[str, Any] = {"query": segments_to_text(segments)}
         if system_prompt_text:
             user_query_payload["referenced_attachments"] = {
                 "SYSTEM_PROMPT": {
@@ -121,6 +122,14 @@ def attach_user_and_tools_to_inputs(packet: Dict[str, Any], history: List[ChatMe
 - `attempt_completion`</ALERT>{system_prompt_text}"""
                     }
                 }
+        # Vision: 扫描所有历史消息提取图像（reorder 可能将多模态消息拆分）
+        all_images: List[Dict[str, Any]] = []
+        for msg in history:
+            if msg.role == "user":
+                msg_segments = normalize_content_to_list(msg.content)
+                all_images.extend(extract_images_from_segments(msg_segments))
+        if all_images:
+            packet["input"]["context"]["images"] = all_images
         packet["input"]["user_inputs"]["inputs"].append({"user_query": user_query_payload})
         return
     if last.role == "tool" and last.tool_call_id:

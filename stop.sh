@@ -51,11 +51,17 @@ stop_servers() {
 
     # 停止Python服务器进程
     log_info "终止Python服务器进程..."
+    pkill -f "warp-rustls-proxy" 2>/dev/null || true
     pkill -f "python3 server.py" 2>/dev/null || true
     pkill -f "python3 openai_compat.py" 2>/dev/null || true
 
     # 停止端口相关的进程
     log_info "清理端口进程..."
+    if lsof -Pi :28887 -sTCP:LISTEN -t >/dev/null 2>&1; then
+        log_info "终止端口28887 (Rust TLS代理)上的进程..."
+        lsof -ti:28887 | xargs kill -9 2>/dev/null || true
+    fi
+
     if lsof -Pi :28888 -sTCP:LISTEN -t >/dev/null 2>&1; then
         log_info "终止端口28888 (Protobuf桥接服务器)上的进程..."
         lsof -ti:28888 | xargs kill -9 2>/dev/null || true
@@ -70,7 +76,7 @@ stop_servers() {
     sleep 2
 
     # 验证停止状态
-    if ! lsof -Pi :28888 -sTCP:LISTEN -t >/dev/null 2>&1 && ! lsof -Pi :28889 -sTCP:LISTEN -t >/dev/null 2>&1; then
+    if ! lsof -Pi :28887 -sTCP:LISTEN -t >/dev/null 2>&1 && ! lsof -Pi :28888 -sTCP:LISTEN -t >/dev/null 2>&1 && ! lsof -Pi :28889 -sTCP:LISTEN -t >/dev/null 2>&1; then
         log_success "所有服务器已成功停止"
     else
         log_warning "某些进程可能仍在运行，请手动检查"
@@ -87,6 +93,13 @@ show_status() {
     echo "=========================================="
     echo "📊 当前服务器状态"
     echo "=========================================="
+
+    # 检查端口28887
+    if lsof -Pi :28887 -sTCP:LISTEN -t >/dev/null 2>&1; then
+        echo -e "${GREEN}✅ Rust TLS代理 (端口28887): 运行中${NC}"
+    else
+        echo -e "${RED}❌ Rust TLS代理 (端口28887): 已停止${NC}"
+    fi
 
     # 检查端口28888
     if lsof -Pi :28888 -sTCP:LISTEN -t >/dev/null 2>&1; then

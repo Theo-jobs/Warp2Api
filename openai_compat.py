@@ -10,6 +10,11 @@ from __future__ import annotations
 
 import os
 import asyncio
+from dotenv import load_dotenv
+
+# Load .env BEFORE importing app so that API_TOKEN is available
+# when BearerTokenAuth initializes at module level.
+load_dotenv()
 
 from protobuf2openai.app import app  # FastAPI app
 

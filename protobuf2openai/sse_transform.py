@@ -78,6 +78,10 @@ async def stream_openai_sse(packet: Dict[str, Any], completion_id: str, created_
                                     current = ""
                                     continue
                                 current = ""
+                                if isinstance(ev, dict) and ev.get("error"):
+                                    err_msg = str(ev.get("error"))
+                                    logger.error("[OpenAI Compat] Bridge SSE error event: %s", err_msg)
+                                    raise RuntimeError(f"bridge_sse_error: {err_msg}")
                                 event_data = (ev or {}).get("parsed_data") or {}
 
                                 # 打印接收到的 Protobuf 事件（解析后）
@@ -218,6 +222,10 @@ async def stream_openai_sse(packet: Dict[str, Any], completion_id: str, created_
                             current = ""
                             continue
                         current = ""
+                        if isinstance(ev, dict) and ev.get("error"):
+                            err_msg = str(ev.get("error"))
+                            logger.error("[OpenAI Compat] Bridge SSE error event: %s", err_msg)
+                            raise RuntimeError(f"bridge_sse_error: {err_msg}")
                         event_data = (ev or {}).get("parsed_data") or {}
 
                         # 打印接收到的 Protobuf 事件（解析后）

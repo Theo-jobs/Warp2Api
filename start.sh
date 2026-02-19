@@ -129,6 +129,55 @@ check_network() {
     fi
 }
 
+# 启动Rust TLS代理
+start_rust_proxy() {
+    # 检查是否启用了 rustls 代理（默认启用）
+    RUSTLS_ENABLED="${WARP_RUSTLS_PROXY:-1}"
+    if [ "$RUSTLS_ENABLED" = "0" ] || [ "$RUSTLS_ENABLED" = "false" ] || [ "$RUSTLS_ENABLED" = "no" ]; then
+        log_info "Rust TLS代理已禁用 (WARP_RUSTLS_PROXY=$RUSTLS_ENABLED)"
+        return 0
+    fi
+
+    RUST_PROXY_PORT="${RUST_PROXY_PORT:-28887}"
+    RUST_PROXY_BIN="$(dirname "$0")/rust-proxy/target/release/warp-rustls-proxy"
+
+    if [ ! -f "$RUST_PROXY_BIN" ]; then
+        log_warning "Rust TLS代理二进制不存在: $RUST_PROXY_BIN"
+        log_warning "跳过Rust代理，将直连 app.warp.dev（可能遇到403）"
+        log_warning "编译方法: cd rust-proxy && cargo build --release"
+        return 0
+    fi
+
+    log_info "启动Rust TLS代理 (rustls + ring)..."
+
+    # 检查端口是否被占用
+    if lsof -Pi :$RUST_PROXY_PORT -sTCP:LISTEN -t >/dev/null 2>&1; then
+        log_warning "端口${RUST_PROXY_PORT}已被占用，尝试终止现有进程..."
+        lsof -ti:$RUST_PROXY_PORT | xargs kill -9 2>/dev/null || true
+        sleep 1
+    fi
+
+    # 启动 Rust 代理（后台运行）
+    RUST_PROXY_PORT=$RUST_PROXY_PORT nohup "$RUST_PROXY_BIN" > rust_proxy.log 2>&1 &
+    RUST_PROXY_PID=$!
+
+    # 等待代理启动
+    log_info "等待Rust TLS代理启动..."
+    for i in {1..10}; do
+        if curl -s http://127.0.0.1:$RUST_PROXY_PORT/health >/dev/null 2>&1; then
+            log_success "Rust TLS代理启动成功 (PID: $RUST_PROXY_PID)"
+            log_info "📍 Rust TLS代理地址: http://127.0.0.1:$RUST_PROXY_PORT"
+            echo "🦀 Rust TLS代理: http://127.0.0.1:$RUST_PROXY_PORT (rustls + ring)"
+            return 0
+        fi
+        sleep 0.5
+    done
+
+    log_error "Rust TLS代理启动失败"
+    cat rust_proxy.log 2>/dev/null
+    log_warning "将继续启动，但可能遇到403错误"
+}
+
 # 启动Protobuf桥接服务器
 start_bridge_server() {
     log_info "启动Protobuf桥接服务器..."
@@ -203,6 +252,7 @@ show_status() {
     echo "=========================================="
     echo "🚀 Warp2Api 服务器状态"
     echo "=========================================="
+    echo "📍 Rust TLS代理:       http://127.0.0.1:28887 (rustls)"
     echo "📍 Protobuf桥接服务器: http://localhost:28888"
     echo "📍 OpenAI兼容API服务器: http://localhost:28889"
     echo "📍 API文档: http://localhost:28889/docs"
@@ -248,10 +298,12 @@ stop_servers() {
     log_info "停止所有服务器..."
 
     # 停止所有相关进程
+    pkill -f "warp-rustls-proxy" 2>/dev/null || true
     pkill -f "python3 server.py" 2>/dev/null || true
     pkill -f "python3 openai_compat.py" 2>/dev/null || true
 
     # 清理可能的僵尸进程（使用小众端口）
+    lsof -ti:28887 | xargs kill -9 2>/dev/null || true
     lsof -ti:28888 | xargs kill -9 2>/dev/null || true
     lsof -ti:28889 | xargs kill -9 2>/dev/null || true
 
@@ -331,7 +383,8 @@ main() {
     check_dependencies
     check_network
 
-    # 启动服务器
+    # 启动服务器（Rust代理必须先于Python服务器）
+    start_rust_proxy
     start_bridge_server
     start_openai_server
 

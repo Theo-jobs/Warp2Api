@@ -111,11 +111,20 @@ def extract_images_from_segments(segments: List[Dict[str, Any]]) -> List[Dict[st
 
         if result:
             raw_bytes, mime_type = result
+            # Warp 后端将 protobuf bytes 字段直接 decode 为字符串拼入 data URL，
+            # 而非重新 base64 编码。因此我们需要把 base64 字符串本身作为
+            # UTF-8 bytes 传入，让 Warp decode("utf-8") 后直接得到合法 base64。
+            #
+            # 流程：b64_str → encode("utf-8") → 作为 protobuf bytes
+            # 但 protobuf_utils 的 TYPE_BYTES 处理会对 str 值做 b64decode，
+            # 所以这里需要再包一层 base64（外层供 TYPE_BYTES 解码，内层是实际数据）。
+            inner_b64 = base64.b64encode(raw_bytes).decode("ascii")
+            outer_b64 = base64.b64encode(inner_b64.encode("utf-8")).decode("ascii")
             images.append({
-                "data": base64.b64encode(raw_bytes).decode("ascii"),
+                "data": outer_b64,
                 "mime_type": mime_type,
             })
-            logger.info("[Vision] 提取图像: %s, %d bytes", mime_type, len(raw_bytes))
+            logger.info("[Vision] 提取图像: %s, %d bytes (b64→bytes→b64 双层编码)", mime_type, len(raw_bytes))
     return images
 
 

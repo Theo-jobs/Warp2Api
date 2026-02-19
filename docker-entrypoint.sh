@@ -64,5 +64,8 @@ echo "📍 模型列表: http://0.0.0.0:${OPENAI_PORT}/v1/models"
 echo "📍 健康检查: http://0.0.0.0:${OPENAI_PORT}/healthz"
 echo "=========================================="
 
+# Docker 内必须绑定 0.0.0.0 才能接受外部流量
+export HOST="0.0.0.0"
+
 # 前台运行 OpenAI 服务器（保持容器存活）
 exec python3 /app/openai_compat.py --port $OPENAI_PORT

@@ -14,3 +14,12 @@ wheels/
 logs/
 *.log
 packets_docs/
+
+# Debug artifacts
+debug/
+
+# Rust build cache
+rust-proxy/target/
+
+# Docker exported images
+*.tar.gz

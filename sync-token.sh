@@ -22,6 +22,9 @@ CONTAINER_NAME="warp2api"
 
 # Warp 本地数据路径
 WARP_USER_FILE="$HOME/Library/Application Support/dev.warp.Warp-Stable/dev.warp.Warp-User"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LOCAL_ENV_FILE="${SCRIPT_DIR}/.env"
+EXTRACT_PY="${SCRIPT_DIR}/extract_warp_token.py"
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -35,25 +38,76 @@ warn() { echo -e "${YELLOW}[!]${NC} $*"; }
 err()  { echo -e "${RED}[✗]${NC} $*"; exit 1; }
 info() { echo -e "${BLUE}[→]${NC} $*"; }
 
+# ========== 读取已有 API_TOKEN ==========
+get_existing_api_token() {
+    local file_path="${1:-}"
+    if [ -z "$file_path" ] || [ ! -f "$file_path" ]; then
+        return 0
+    fi
+    grep '^API_TOKEN=' "$file_path" 2>/dev/null | head -1 | cut -d'=' -f2- | sed 's/^"//' | sed 's/"$//' | sed "s/^'//" | sed "s/'$//"
+}
+
 # ========== 提取 Warp 帐号信息 ==========
 extract_warp_info() {
     if [ ! -f "$WARP_USER_FILE" ]; then
         err "Warp 用户数据文件不存在: $WARP_USER_FILE\n    请确保 Warp 客户端已登录"
     fi
 
-    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-    EXTRACT_PY="${SCRIPT_DIR}/extract_warp_token.py"
-
     if [ ! -f "$EXTRACT_PY" ]; then
         err "extract_warp_token.py 不存在: $EXTRACT_PY"
     fi
 
-    # 用独立 Python 脚本提取，输出为 shell 变量赋值
-    EXTRACT_OUTPUT=$(python3 "$EXTRACT_PY" "$WARP_USER_FILE" 2>/dev/null)
-    if echo "$EXTRACT_OUTPUT" | grep -q "ERROR="; then
+    # 用独立 Python 脚本提取（JSON 输出），避免 eval 注入风险
+    EXTRACT_JSON=$(python3 "$EXTRACT_PY" --json "$WARP_USER_FILE" 2>/dev/null || true)
+    if [ -z "$EXTRACT_JSON" ]; then
         err "提取 Warp 帐号信息失败"
     fi
-    eval "$EXTRACT_OUTPUT"
+
+    REFRESH_TOKEN=$(python3 - <<'PY' "$EXTRACT_JSON"
+import json, sys
+try:
+    obj = json.loads(sys.argv[1])
+    print(obj.get("refresh_token", ""))
+except Exception:
+    print("")
+PY
+)
+    ACCOUNT_EMAIL=$(python3 - <<'PY' "$EXTRACT_JSON"
+import json, sys
+try:
+    obj = json.loads(sys.argv[1])
+    print(obj.get("account_email", ""))
+except Exception:
+    print("")
+PY
+)
+    USER_ID=$(python3 - <<'PY' "$EXTRACT_JSON"
+import json, sys
+try:
+    obj = json.loads(sys.argv[1])
+    print(obj.get("user_id", ""))
+except Exception:
+    print("")
+PY
+)
+    LOCAL_ID=$(python3 - <<'PY' "$EXTRACT_JSON"
+import json, sys
+try:
+    obj = json.loads(sys.argv[1])
+    print(obj.get("local_id", ""))
+except Exception:
+    print("")
+PY
+)
+    ID_TOKEN=$(python3 - <<'PY' "$EXTRACT_JSON"
+import json, sys
+try:
+    obj = json.loads(sys.argv[1])
+    print(obj.get("id_token_preview", ""))
+except Exception:
+    print("")
+PY
+)
 
     if [ -z "$REFRESH_TOKEN" ]; then
         err "无法提取 refresh_token，请确保 Warp 客户端已登录"
@@ -80,10 +134,12 @@ show_account_info() {
 generate_env_content() {
     local api_token="${1:-}"
 
-    # 如果本地 .env 已有 API_TOKEN，保留它
-    if [ -z "$api_token" ] && [ -f ".env" ]; then
-        api_token=$(grep "^API_TOKEN=" .env 2>/dev/null | head -1 | cut -d'=' -f2- | sed 's/^"//' | sed 's/"$//')
+    # 若未显式传入，优先保留当前本地 .env 的 API_TOKEN
+    if [ -z "$api_token" ]; then
+        api_token="$(get_existing_api_token "$LOCAL_ENV_FILE")"
     fi
+
+    # 兼容旧逻辑：仍兜底 0000，但尽量保留旧 token
     api_token="${api_token:-0000}"
 
     cat <<ENVEOF
@@ -109,8 +165,10 @@ ENVEOF
 
 # ========== 更新本地 .env ==========
 update_local_env() {
-    local env_file="$(cd "$(dirname "$0")" && pwd)/.env"
-    generate_env_content > "$env_file"
+    local env_file="$LOCAL_ENV_FILE"
+    local old_api_token=""
+    old_api_token="$(get_existing_api_token "$env_file")"
+    generate_env_content "$old_api_token" > "$env_file"
     log "本地 .env 已更新: $env_file"
 }
 
@@ -124,9 +182,23 @@ sync_to_remote() {
 
     info "同步 Token 到极空间 (${SSH_HOST})..."
 
-    # 生成临时 .env
+    # 生成临时 .env（优先保留远端已有 API_TOKEN，其次本地 .env）
+    local remote_api_token=""
+    local local_api_token=""
+    remote_api_token=$(sshpass -p "${SSH_PASS}" ssh -F /dev/null -o StrictHostKeyChecking=no \
+        -p "${SSH_PORT}" "${SSH_USER}@${SSH_HOST}" \
+        "if [ -f '${COMPOSE_DIR}/.env' ]; then grep '^API_TOKEN=' '${COMPOSE_DIR}/.env' | head -1 | cut -d'=' -f2-; fi" 2>/dev/null || true)
+    remote_api_token=$(echo "$remote_api_token" | sed 's/^"//' | sed 's/"$//' | sed "s/^'//" | sed "s/'$//")
+    local_api_token="$(get_existing_api_token "$LOCAL_ENV_FILE")"
+
     TMPENV=$(mktemp)
-    generate_env_content > "$TMPENV"
+    if [ -n "$remote_api_token" ]; then
+        generate_env_content "$remote_api_token" > "$TMPENV"
+    elif [ -n "$local_api_token" ]; then
+        generate_env_content "$local_api_token" > "$TMPENV"
+    else
+        generate_env_content > "$TMPENV"
+    fi
 
     # 上传
     sshpass -p "${SSH_PASS}" scp -F /dev/null -o StrictHostKeyChecking=no \

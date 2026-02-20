@@ -9,6 +9,5 @@ debug/
 logs/
 *.log
 rust-proxy/target/
-!rust-proxy/target/release/warp-rustls-proxy
 node_modules
 .DS_Store

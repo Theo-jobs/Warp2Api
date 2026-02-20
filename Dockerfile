@@ -21,9 +21,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# 复制 Rust 代理二进制
-COPY --from=rust-builder /build/target/release/warp-rustls-proxy /app/rust-proxy/target/release/warp-rustls-proxy
-
 # 安装 Python 依赖
 COPY pyproject.toml ./
 RUN pip install --no-cache-dir \
@@ -40,9 +37,12 @@ RUN pip install --no-cache-dir \
 # 复制项目代码
 COPY . .
 
+# 最后覆盖 Rust 代理二进制，避免被上下文中的本地 target 产物覆盖
+COPY --from=rust-builder /build/target/release/warp-rustls-proxy /app/rust-proxy/target/release/warp-rustls-proxy
+
 # 复制启动脚本
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
-RUN chmod +x /app/docker-entrypoint.sh
+RUN chmod +x /app/docker-entrypoint.sh /app/rust-proxy/target/release/warp-rustls-proxy
 
 # 创建日志目录
 RUN mkdir -p /app/logs

@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Warp2Api 账号管理</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #f5f5f5;
+            padding: 20px;
+        }
+        .container { max-width: 1400px; margin: 0 auto; }
+        h1 { color: #333; margin-bottom: 20px; }
+
+        .summary-cards {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 30px;
+        }
+        .card {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .card-title { font-size: 14px; color: #666; margin-bottom: 8px; }
+        .card-value { font-size: 28px; font-weight: bold; color: #333; }
+        .card-subtitle { font-size: 12px; color: #999; margin-top: 4px; }
+
+        .controls {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        input[type="text"], select {
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        button {
+            padding: 8px 16px;
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        button:hover { background: #0056b3; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+
+        table {
+            width: 100%;
+            background: white;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #eee;
+        }
+        th {
+            background: #f8f9fa;
+            font-weight: 600;
+            color: #333;
+        }
+        tr:hover { background: #f8f9fa; }
+
+        .status-badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+        .status-available { background: #d4edda; color: #155724; }
+        .status-in_use { background: #fff3cd; color: #856404; }
+        .status-disabled { background: #f8d7da; color: #721c24; }
+
+        .pagination {
+            display: flex;
+            justify-content: center;
+            gap: 10px;
+            margin-top: 20px;
+        }
+        .pagination button {
+            padding: 6px 12px;
+            background: white;
+            color: #007bff;
+            border: 1px solid #007bff;
+        }
+        .pagination button:hover { background: #007bff; color: white; }
+        .pagination button:disabled {
+            background: #f5f5f5;
+            color: #ccc;
+            border-color: #ccc;
+        }
+
+        .loading { text-align: center; padding: 40px; color: #666; }
+        .error { background: #f8d7da; color: #721c24; padding: 15px; border-radius: 4px; margin-bottom: 20px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📊 Warp2Api 账号管理</h1>
+
+        <div id="error" class="error" style="display: none;"></div>
+
+        <div class="summary-cards">
+            <div class="card">
+                <div class="card-title">总账号数</div>
+                <div class="card-value" id="total-count">-</div>
+            </div>
+            <div class="card">
+                <div class="card-title">可用账号</div>
+                <div class="card-value" id="available-count">-</div>
+            </div>
+            <div class="card">
+                <div class="card-title">总额度</div>
+                <div class="card-value" id="total-limit">-</div>
+            </div>
+            <div class="card">
+                <div class="card-title">已用额度</div>
+                <div class="card-value" id="used-limit">-</div>
+            </div>
+            <div class="card">
+                <div class="card-title">剩余额度</div>
+                <div class="card-value" id="remaining-limit">-</div>
+                <div class="card-subtitle" id="usage-percent">-</div>
+            </div>
+        </div>
+
+        <div class="controls">
+            <input type="text" id="keyword" placeholder="搜索邮箱或 local_id">
+            <select id="status">
+                <option value="">全部状态</option>
+                <option value="available">可用</option>
+                <option value="in_use">使用中</option>
+                <option value="disabled">已禁用</option>
+            </select>
+            <button onclick="loadAccounts()">🔍 搜索</button>
+            <button onclick="loadSummary()">🔄 刷新</button>
+        </div>
+
+        <div id="loading" class="loading">加载中...</div>
+
+        <table id="accounts-table" style="display: none;">
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>邮箱</th>
+                    <th>Local ID</th>
+                    <th>状态</th>
+                    <th>总额度</th>
+                    <th>已用</th>
+                    <th>剩余</th>
+                    <th>使用次数</th>
+                    <th>最后检查</th>
+                </tr>
+            </thead>
+            <tbody id="accounts-body"></tbody>
+        </table>
+
+        <div class="pagination" id="pagination" style="display: none;"></div>
+    </div>
+
+    <script>
+        let currentPage = 1;
+        const pageSize = 20;
+
+        async function loadSummary() {
+            try {
+                const response = await fetch('/api/accounts/summary');
+                const data = await response.json();
+
+                if (data.success) {
+                    const summary = data.summary;
+                    document.getElementById('total-count').textContent = summary.total_count;
+                    document.getElementById('available-count').textContent = summary.status_counts.available || 0;
+                    document.getElementById('total-limit').textContent = summary.total_limit;
+                    document.getElementById('used-limit').textContent = summary.used_limit;
+                    document.getElementById('remaining-limit').textContent = summary.remaining_limit;
+
+                    const usagePercent = summary.total_limit > 0
+                        ? ((summary.used_limit / summary.total_limit) * 100).toFixed(1)
+                        : 0;
+                    document.getElementById('usage-percent').textContent = `使用率 ${usagePercent}%`;
+                }
+            } catch (error) {
+                showError('加载汇总数据失败: ' + error.message);
+            }
+        }
+
+        async function loadAccounts(page = 1) {
+            currentPage = page;
+            const keyword = document.getElementById('keyword').value;
+            const status = document.getElementById('status').value;
+
+            document.getElementById('loading').style.display = 'block';
+            document.getElementById('accounts-table').style.display = 'none';
+            document.getElementById('pagination').style.display = 'none';
+
+            try {
+                const params = new URLSearchParams({
+                    page: page,
+                    page_size: pageSize,
+                });
+                if (keyword) params.append('keyword', keyword);
+                if (status) params.append('status', status);
+
+                const response = await fetch(`/api/accounts?${params}`);
+                const data = await response.json();
+
+                renderAccounts(data.accounts);
+                renderPagination(data.page, data.total_pages);
+
+                document.getElementById('loading').style.display = 'none';
+                document.getElementById('accounts-table').style.display = 'table';
+                document.getElementById('pagination').style.display = 'flex';
+            } catch (error) {
+                document.getElementById('loading').style.display = 'none';
+                showError('加载账号列表失败: ' + error.message);
+            }
+        }
+
+        function renderAccounts(accounts) {
+            const tbody = document.getElementById('accounts-body');
+            tbody.innerHTML = '';
+
+            accounts.forEach(account => {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `
+                    <td>${account.id}</td>
+                    <td>${account.email}</td>
+                    <td>${account.local_id.substring(0, 20)}...</td>
+                    <td><span class="status-badge status-${account.status}">${account.status}</span></td>
+                    <td>${account.total_limit}</td>
+                    <td>${account.used_limit}</td>
+                    <td>${account.remaining_limit}</td>
+                    <td>${account.use_count || 0}</td>
+                    <td>${account.last_check ? new Date(account.last_check).toLocaleString('zh-CN') : '-'}</td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        function renderPagination(page, totalPages) {
+            const pagination = document.getElementById('pagination');
+            pagination.innerHTML = '';
+
+            const prevBtn = document.createElement('button');
+            prevBtn.textContent = '上一页';
+            prevBtn.disabled = page <= 1;
+            prevBtn.onclick = () => loadAccounts(page - 1);
+            pagination.appendChild(prevBtn);
+
+            const pageInfo = document.createElement('span');
+            pageInfo.textContent = `第 ${page} / ${totalPages} 页`;
+            pageInfo.style.padding = '6px 12px';
+            pagination.appendChild(pageInfo);
+
+            const nextBtn = document.createElement('button');
+            nextBtn.textContent = '下一页';
+            nextBtn.disabled = page >= totalPages;
+            nextBtn.onclick = () => loadAccounts(page + 1);
+            pagination.appendChild(nextBtn);
+        }
+
+        function showError(message) {
+            const errorDiv = document.getElementById('error');
+            errorDiv.textContent = message;
+            errorDiv.style.display = 'block';
+            setTimeout(() => {
+                errorDiv.style.display = 'none';
+            }, 5000);
+        }
+
+        // 初始加载
+        loadSummary();
+        loadAccounts();
+
+        // 回车搜索
+        document.getElementById('keyword').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') loadAccounts();
+        });
+    </script>
+</body>
+</html>

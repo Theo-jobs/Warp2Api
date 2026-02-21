@@ -545,3 +545,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# 导出 app 供 uvicorn 直接使用
+app = create_app()

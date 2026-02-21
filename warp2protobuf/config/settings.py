@@ -12,6 +12,14 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
 # Path configurations
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent.parent.parent
 PROTO_DIR = SCRIPT_DIR / "proto"
@@ -48,4 +56,16 @@ SYSTEM_STR = {"agent_output.text", "server_message_data", "USER_INITIATED", "age
 
 # JWT refresh configuration
 REFRESH_TOKEN_B64 = "Z3JhbnRfdHlwZT1yZWZyZXNoX3Rva2VuJnJlZnJlc2hfdG9rZW49QU1mLXZCeFNSbWRodmVHR0JZTTY5cDA1a0RoSW4xaTd3c2NBTEVtQzlmWURScEh6akVSOWRMN2trLWtIUFl3dlk5Uk9rbXk1MHFHVGNJaUpaNEFtODZoUFhrcFZQTDkwSEptQWY1Zlo3UGVqeXBkYmNLNHdzbzhLZjNheGlTV3RJUk9oT2NuOU56R2FTdmw3V3FSTU5PcEhHZ0JyWW40SThrclc1N1I4X3dzOHU3WGNTdzh1MERpTDlIcnBNbTBMdHdzQ2g4MWtfNmJiMkNXT0ViMWxJeDNIV1NCVGVQRldzUQ=="
-REFRESH_URL = "https://app.warp.dev/proxy/token?key=AIzaSyBdy3O3S9hrdayLJxJ7mriBR4qgUaUygAs" 
+REFRESH_URL = "https://app.warp.dev/proxy/token?key=AIzaSyBdy3O3S9hrdayLJxJ7mriBR4qgUaUygAs"
+
+# Account pool integration flags
+ACCOUNT_POOL_ENABLED = _env_bool("ACCOUNT_POOL_ENABLED", False)
+ACCOUNT_POOL_BASE_URL = os.getenv("ACCOUNT_POOL_BASE_URL", "http://account-pool-service:38019")
+ACCOUNT_POOL_ALLOCATE_TIMEOUT = float(os.getenv("ACCOUNT_POOL_ALLOCATE_TIMEOUT", "5"))
+ACCOUNT_POOL_RELEASE_TIMEOUT = float(os.getenv("ACCOUNT_POOL_RELEASE_TIMEOUT", "5"))
+ACCOUNT_POOL_SWITCH_MAX_RETRIES = int(os.getenv("ACCOUNT_POOL_SWITCH_MAX_RETRIES", "2"))
+ACCOUNT_POOL_FALLBACK_TO_ENV = _env_bool("ACCOUNT_POOL_FALLBACK_TO_ENV", True)
+
+# Account database configuration
+ACCOUNT_DB_PATH = os.getenv("ACCOUNT_DB_PATH", str(SCRIPT_DIR / "accounts.db"))
+ACCOUNT_ADMIN_ENABLED = _env_bool("ACCOUNT_ADMIN_ENABLED", True)

@@ -257,35 +257,6 @@
                 showError('加载汇总数据失败: ' + error.message);
             }
         }
-                    document.getElementById('total-limit').textContent = summary.total_limit;
-                    document.getElementById('used-limit').textContent = summary.used_limit;
-                    document.getElementById('remaining-limit').textContent = summary.remaining_limit;
-
-                    const usagePercent = summary.total_limit > 0
-                        ? ((summary.used_limit / summary.total_limit) * 100).toFixed(1)
-                        : 0;
-                    document.getElementById('usage-percent').textContent = `使用率 ${usagePercent}%`;
-                }
-
-                if (poolData.success) {
-                    const pool = poolData.status;
-                    document.getElementById('exhausted-count').textContent =
-                        `额度耗尽: ${pool.exhausted}`;
-                }
-
-                if (currentData.success && currentData.account) {
-                    const acc = currentData.account;
-                    document.getElementById('current-email').textContent = acc.email;
-                    document.getElementById('current-info').textContent =
-                        `剩余额度: ${acc.remaining_limit} | 使用次数: ${acc.use_count || 0} | 最后使用: ${acc.last_used ? new Date(acc.last_used).toLocaleString('zh-CN') : '-'}`;
-                } else {
-                    document.getElementById('current-email').textContent = '无当前账号';
-                    document.getElementById('current-info').textContent = '尚未使用任何账号';
-                }
-            } catch (error) {
-                showError('加载汇总数据失败: ' + error.message);
-            }
-        }
 
         async function loadAccounts(page = 1) {
             currentPage = page;

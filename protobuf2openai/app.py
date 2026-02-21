@@ -87,24 +87,6 @@ async def get_accounts_summary():
     }
 
 
-@app.get("/api/accounts/{account_id}")
-async def get_account_detail(account_id: int):
-    """获取单个账号详情"""
-    if not ACCOUNT_ADMIN_ENABLED:
-        raise HTTPException(status_code=403, detail="Account management is disabled")
-
-    store = AccountStore(ACCOUNT_DB_PATH)
-    account = store.get_account_by_id(account_id)
-
-    if not account:
-        raise HTTPException(status_code=404, detail="Account not found")
-
-    return {
-        "success": True,
-        "account": account,
-    }
-
-
 @app.patch("/api/accounts/{account_id}/limit")
 async def update_account_limit(account_id: int, request: UpdateLimitRequest):
     """更新账号额度"""
@@ -175,6 +157,24 @@ async def get_current_account():
     return {
         "success": True,
         "account": recent[0],
+    }
+
+
+@app.get("/api/accounts/{account_id}")
+async def get_account_detail(account_id: int):
+    """获取单个账号详情"""
+    if not ACCOUNT_ADMIN_ENABLED:
+        raise HTTPException(status_code=403, detail="Account management is disabled")
+
+    store = AccountStore(ACCOUNT_DB_PATH)
+    account = store.get_account_by_id(account_id)
+
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    return {
+        "success": True,
+        "account": account,
     }
 
 

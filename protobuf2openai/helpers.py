@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import base64
+import ipaddress
 import re
+import socket
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse, urlunparse
 
 import httpx
 
@@ -64,8 +67,68 @@ def _parse_data_uri(url: str) -> Optional[Tuple[bytes, str]]:
         return None
 
 
+def _sanitize_url_for_log(url: str) -> str:
+    """日志脱敏：仅保留 scheme+host+path，隐藏 query/fragment。"""
+    try:
+        p = urlparse(url)
+        return urlunparse((p.scheme, p.netloc, p.path, "", "", ""))
+    except Exception:
+        return url[:80]
+
+
+def _is_public_http_url(url: str) -> bool:
+    """仅允许公网 http/https，阻止本地/内网/链路本地地址（SSRF 防护）。"""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        host = parsed.hostname
+        if not host:
+            return False
+
+        # localhost / *.local 一律拒绝
+        lower_host = host.lower()
+        if lower_host in {"localhost", "localhost.localdomain"} or lower_host.endswith(".local"):
+            return False
+
+        try:
+            ip = ipaddress.ip_address(host)
+            return not (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_multicast
+                or ip.is_reserved
+                or ip.is_unspecified
+            )
+        except ValueError:
+            # 域名解析后再判定
+            infos = socket.getaddrinfo(host, None)
+            if not infos:
+                return False
+            for info in infos:
+                addr = info[4][0]
+                ip = ipaddress.ip_address(addr)
+                if (
+                    ip.is_private
+                    or ip.is_loopback
+                    or ip.is_link_local
+                    or ip.is_multicast
+                    or ip.is_reserved
+                    or ip.is_unspecified
+                ):
+                    return False
+            return True
+    except Exception:
+        return False
+
+
 def _download_image(url: str) -> Optional[Tuple[bytes, str]]:
     """下载远程图像 URL，返回 (raw_bytes, mime_type)。"""
+    if not _is_public_http_url(url):
+        logger.warning("[Vision] 拒绝不安全图像 URL: %s", _sanitize_url_for_log(url))
+        return None
+
     try:
         with httpx.Client(timeout=15.0, follow_redirects=True) as client:
             resp = client.get(url)
@@ -76,7 +139,7 @@ def _download_image(url: str) -> Optional[Tuple[bytes, str]]:
                 ct = "image/jpeg"
             return resp.content, ct
     except Exception as e:
-        logger.warning("[Vision] 图像下载失败: %s — %s", url[:80], e)
+        logger.warning("[Vision] 图像下载失败: %s — %s", _sanitize_url_for_log(url), e)
         return None
 
 

@@ -12,11 +12,71 @@ import os
 import time
 from pathlib import Path
 import httpx
-import asyncio
 from dotenv import load_dotenv, set_key
 
-from ..config.settings import REFRESH_TOKEN_B64, REFRESH_URL, CLIENT_ID, CLIENT_VERSION, OS_CATEGORY, OS_NAME, OS_VERSION
+from ..config.settings import (
+    REFRESH_TOKEN_B64,
+    REFRESH_URL,
+    CLIENT_ID,
+    CLIENT_VERSION,
+    OS_CATEGORY,
+    OS_NAME,
+    OS_VERSION,
+)
 from .logging import logger, log
+
+
+def _mask_token(token: str, keep: int = 4) -> str:
+    """Mask sensitive token values for logs."""
+    if not token:
+        return "<empty>"
+    if len(token) <= keep * 2:
+        return "*" * len(token)
+    return f"{token[:keep]}...{token[-keep:]}"
+
+
+def _build_refresh_headers(payload_length: int) -> dict:
+    return {
+        "x-warp-client-id": CLIENT_ID,
+        "x-warp-client-version": CLIENT_VERSION,
+        "x-warp-os-category": OS_CATEGORY,
+        "x-warp-os-name": OS_NAME,
+        "x-warp-os-version": OS_VERSION,
+        "content-type": "application/x-www-form-urlencoded",
+        "accept": "*/*",
+        "accept-encoding": "gzip, br",
+        "content-length": str(payload_length),
+    }
+
+
+async def refresh_access_token_with_refresh_token(refresh_token: str) -> str:
+    """Exchange refresh_token for access_token without mutating .env."""
+    if not refresh_token:
+        raise RuntimeError("refresh_token is required")
+
+    payload = f"grant_type=refresh_token&refresh_token={refresh_token}".encode("utf-8")
+    headers = _build_refresh_headers(len(payload))
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+        response = await client.post(REFRESH_URL, headers=headers, content=payload)
+
+    if response.status_code != 200:
+        preview = (response.text or "")[:200]
+        raise RuntimeError(
+            f"refresh_access_token_with_refresh_token failed: HTTP {response.status_code} {preview}"
+        )
+
+    token_data = response.json()
+    access_token = token_data.get("access_token")
+    if not access_token:
+        raise RuntimeError("refresh response missing access_token")
+
+    logger.info(
+        "refresh_access_token_with_refresh_token success: refresh=%s access=%s",
+        _mask_token(refresh_token),
+        _mask_token(access_token),
+    )
+    return access_token
 
 
 def decode_jwt_payload(token: str) -> dict:
@@ -47,6 +107,20 @@ def is_token_expired(token: str, buffer_minutes: int = 5) -> bool:
     return (expiry_time - current_time) <= buffer_time
 
 
+def get_user_id() -> str:
+    """Extract user_id/sub from current JWT token in environment."""
+    token = os.getenv("WARP_JWT", "")
+    if not token:
+        return ""
+
+    payload = decode_jwt_payload(token)
+    if not payload:
+        return ""
+
+    user_id = payload.get("user_id") or payload.get("sub")
+    return str(user_id or "")
+
+
 async def refresh_jwt_token() -> dict:
     """Refresh the JWT token using the refresh token.
 
@@ -54,40 +128,35 @@ async def refresh_jwt_token() -> dict:
     falls back to the baked-in REFRESH_TOKEN_B64 payload.
     """
     logger.info("Refreshing JWT token...")
-    # Prefer dynamic refresh token from environment if present
     env_refresh = os.getenv("WARP_REFRESH_TOKEN")
+
     if env_refresh:
-        payload = f"grant_type=refresh_token&refresh_token={env_refresh}".encode("utf-8")
-    else:
-        payload = base64.b64decode(REFRESH_TOKEN_B64)
-    headers = {
-        "x-warp-client-id": CLIENT_ID,
-        "x-warp-client-version": CLIENT_VERSION,
-        "x-warp-os-category": OS_CATEGORY,
-        "x-warp-os-name": OS_NAME,
-        "x-warp-os-version": OS_VERSION,
-        "content-type": "application/x-www-form-urlencoded",
-        "accept": "*/*",
-        "accept-encoding": "gzip, br",
-        "content-length": str(len(payload))
-    }
+        try:
+            access_token = await refresh_access_token_with_refresh_token(env_refresh)
+            return {"access_token": access_token}
+        except Exception as exc:
+            logger.error("Error refreshing token via WARP_REFRESH_TOKEN: %s", exc)
+            return {}
+
     try:
+        payload = base64.b64decode(REFRESH_TOKEN_B64)
+        headers = _build_refresh_headers(len(payload))
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 REFRESH_URL,
                 headers=headers,
-                content=payload
+                content=payload,
             )
-            if response.status_code == 200:
-                token_data = response.json()
-                logger.info("Token refresh successful")
-                return token_data
-            else:
-                logger.error(f"Token refresh failed: {response.status_code}")
-                logger.error(f"Response: {response.text}")
-                return {}
+        if response.status_code == 200:
+            token_data = response.json()
+            logger.info("Token refresh successful")
+            return token_data
+
+        logger.error("Token refresh failed: %s", response.status_code)
+        logger.error("Response: %s", response.text)
+        return {}
     except Exception as e:
-        logger.error(f"Error refreshing token: {e}")
+        logger.error("Error refreshing token: %s", e)
         return {}
 
 
@@ -306,21 +375,13 @@ async def acquire_anonymous_access_token() -> str:
 
     # Now call Warp proxy token endpoint to get access_token using this refresh token
     payload = f"grant_type=refresh_token&refresh_token={refresh_token}".encode("utf-8")
-    headers = {
-        "x-warp-client-id": CLIENT_ID,
-        "x-warp-client-version": CLIENT_VERSION,
-        "x-warp-os-category": OS_CATEGORY,
-        "x-warp-os-name": OS_NAME,
-        "x-warp-os-version": OS_VERSION,
-        "content-type": "application/x-www-form-urlencoded",
-        "accept": "*/*",
-        "accept-encoding": "gzip, br",
-        "content-length": str(len(payload))
-    }
+    headers = _build_refresh_headers(len(payload))
     async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
         resp = await client.post(REFRESH_URL, headers=headers, content=payload)
         if resp.status_code != 200:
-            raise RuntimeError(f"Acquire access_token failed: HTTP {resp.status_code} {resp.text[:200]}")
+            raise RuntimeError(
+                f"Acquire access_token failed: HTTP {resp.status_code} {(resp.text or '')[:200]}"
+            )
         token_data = resp.json()
         access = token_data.get("access_token")
         if not access:

@@ -1,6 +1,31 @@
 version: "3.8"
 
 services:
+  account-pool-service:
+    image: python:3.13-slim
+    container_name: account-pool-service
+    working_dir: /app
+    command: ["bash", "-lc", "pip install --no-cache-dir -r requirements.txt && python main.py"]
+    restart: unless-stopped
+    ports:
+      - "38019:38019"
+    environment:
+      - POOL_SERVICE_HOST=0.0.0.0
+      - POOL_SERVICE_PORT=38019
+      - DATABASE_PATH=/data/accounts.db
+      - LOG_FILE=/data/account-pool-service.log
+      - FIREBASE_API_KEY_1=${FIREBASE_API_KEY_1:-}
+      - MOEMAIL_API_KEY=${MOEMAIL_API_KEY:-}
+    volumes:
+      - /Users/chenzhuo/workspace/warp2api_dundunduan/account-pool-service:/app
+      - account-pool-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:38019/health', timeout=3)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
   warp2api:
     build: .
     container_name: warp2api
@@ -9,17 +34,28 @@ services:
       - "28889:28889"   # OpenAI 兼容 API（对外暴露这个即可）
       # - "28888:28888" # Protobuf 桥接（内部使用，一般不需要暴露）
       # - "28887:28887" # Rust TLS 代理（内部使用，一般不需要暴露）
+    depends_on:
+      account-pool-service:
+        condition: service_healthy
     environment:
       # ===== 必填 =====
       - WARP_REFRESH_TOKEN=${WARP_REFRESH_TOKEN}  # Warp 刷新令牌
       - API_TOKEN=${API_TOKEN:-0000}               # 对外 API 认证令牌
+
+      # ===== 账号池开关 =====
+      - ACCOUNT_POOL_ENABLED=${ACCOUNT_POOL_ENABLED:-1}
+      - ACCOUNT_POOL_BASE_URL=${ACCOUNT_POOL_BASE_URL:-http://account-pool-service:38019}
+      - ACCOUNT_POOL_ALLOCATE_TIMEOUT=${ACCOUNT_POOL_ALLOCATE_TIMEOUT:-5}
+      - ACCOUNT_POOL_RELEASE_TIMEOUT=${ACCOUNT_POOL_RELEASE_TIMEOUT:-5}
+      - ACCOUNT_POOL_SWITCH_MAX_RETRIES=${ACCOUNT_POOL_SWITCH_MAX_RETRIES:-2}
+      - ACCOUNT_POOL_FALLBACK_TO_ENV=${ACCOUNT_POOL_FALLBACK_TO_ENV:-1}
 
       # ===== 可选 =====
       # - WARP_JWT=                    # JWT（自动获取，一般不需要手动设置）
       # - W2A_VERBOSE=false            # 详细日志
       # - HTTP_PROXY=                  # 代理设置
       # - HTTPS_PROXY=
-      - NO_PROXY=127.0.0.1,localhost
+      - NO_PROXY=127.0.0.1,localhost,account-pool-service
     volumes:
       - warp2api-logs:/app/logs        # 持久化日志
     healthcheck:
@@ -31,3 +67,4 @@ services:
 
 volumes:
   warp2api-logs:
+  account-pool-data:

@@ -1,22 +1,16 @@
 #!/usr/bin/env python3
 """从本机 Warp 客户端提取帐号信息，输出为 shell 变量赋值格式。"""
-import plistlib
+import argparse
 import base64
 import json
-import sys
 import os
+import plistlib
+import sys
 
 
-def main():
-    warp_file = os.path.expanduser(
-        "~/Library/Application Support/dev.warp.Warp-Stable/dev.warp.Warp-User"
-    )
-    if len(sys.argv) > 1:
-        warp_file = sys.argv[1]
-
+def _extract(warp_file: str) -> dict:
     if not os.path.exists(warp_file):
-        print("ERROR=file_not_found", flush=True)
-        sys.exit(1)
+        raise FileNotFoundError("warp user file not found")
 
     with open(warp_file, "rb") as f:
         data = plistlib.load(f)
@@ -46,15 +40,43 @@ def main():
         except Exception:
             pass
 
-    # 输出 shell 变量（用 heredoc 安全格式）
+    return {
+        "refresh_token": refresh_token,
+        "account_email": email,
+        "user_id": user_id,
+        "local_id": local_id,
+        "id_token_preview": id_token_str[:50],
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Extract Warp account info")
+    parser.add_argument("--json", action="store_true", help="Output JSON format")
+    parser.add_argument("warp_file", nargs="?", default=os.path.expanduser("~/Library/Application Support/dev.warp.Warp-Stable/dev.warp.Warp-User"))
+    args = parser.parse_args()
+
+    try:
+        info = _extract(args.warp_file)
+    except Exception:
+        if args.json:
+            print("{}", flush=True)
+        else:
+            print("ERROR=extract_failed", flush=True)
+        sys.exit(1)
+
+    if args.json:
+        print(json.dumps(info, ensure_ascii=False), flush=True)
+        return
+
+    # backward-compatible shell variable output
     def safe(s: str) -> str:
         return str(s).replace("\\", "\\\\").replace("'", "'\\''")
 
-    print(f"REFRESH_TOKEN='{safe(refresh_token)}'")
-    print(f"ACCOUNT_EMAIL='{safe(email)}'")
-    print(f"USER_ID='{safe(user_id)}'")
-    print(f"ID_TOKEN='{safe(id_token_str[:50])}'")  # 截断，仅用于显示
-    print(f"LOCAL_ID='{safe(local_id)}'")
+    print(f"REFRESH_TOKEN='{safe(info.get('refresh_token', ''))}'")
+    print(f"ACCOUNT_EMAIL='{safe(info.get('account_email', ''))}'")
+    print(f"USER_ID='{safe(info.get('user_id', ''))}'")
+    print(f"ID_TOKEN='{safe(info.get('id_token_preview', ''))}'")
+    print(f"LOCAL_ID='{safe(info.get('local_id', ''))}'")
 
 
 if __name__ == "__main__":

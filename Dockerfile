@@ -32,7 +32,8 @@ RUN pip install --no-cache-dir \
     python-dotenv \
     "websockets>=15.0.1" \
     "requests>=2.32.5" \
-    "openai>=1.106.0"
+    "openai>=1.106.0" \
+    psutil
 
 # 复制项目代码
 COPY . .

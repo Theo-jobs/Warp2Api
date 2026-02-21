@@ -51,14 +51,26 @@ def _extract_http_status_from_error_text(error_text: str) -> Optional[int]:
 def _serialize_history_to_text(history: List[ChatMessage]) -> Optional[str]:
     """将多轮对话历史序列化为文本，用于注入 system prompt。
 
-    跳过 system 消息和最后一条 user/tool 输入（它会作为当前 query 发送）。
+    跳过 system 消息和尾部的当前输入（user 或连续 tool_result + 对应 assistant）。
     """
     non_system = [m for m in history if m.role != "system"]
     if len(non_system) <= 1:
         return None  # 没有历史
 
-    # 最后一条 user/tool 是当前输入，不放入历史
-    history_msgs = non_system[:-1]
+    # 计算尾部当前输入的范围（与 attach_user_and_tools_to_inputs 对齐）
+    if non_system[-1].role == "tool":
+        # 尾部连续 tool_result 全部跳过
+        split_idx = len(non_system)
+        while split_idx > 0 and non_system[split_idx - 1].role == "tool":
+            split_idx -= 1
+        # 对应的 assistant(tool_calls) 也跳过（它的 tool_call 已在结构化输入中）
+        if split_idx > 0 and non_system[split_idx - 1].role == "assistant":
+            split_idx -= 1
+        history_msgs = non_system[:split_idx]
+    else:
+        # 最后一条 user 是当前输入
+        history_msgs = non_system[:-1]
+
     if not history_msgs:
         return None
 

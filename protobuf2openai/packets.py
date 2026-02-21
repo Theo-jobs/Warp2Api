@@ -103,7 +103,7 @@ def map_history_to_warp_messages(history: List[ChatMessage], task_id: str, syste
 
 
 def attach_user_and_tools_to_inputs(packet: Dict[str, Any], history: List[ChatMessage], system_prompt_text: Optional[str]) -> None:
-    # Use the final post-reorder message as input (user or tool result)
+    # Use the final post-reorder message(s) as input (user or tool results)
     if not history:
         raise ValueError("post-reorder 必须至少包含一条消息")
     last = history[-1]
@@ -132,15 +132,22 @@ def attach_user_and_tools_to_inputs(packet: Dict[str, Any], history: List[ChatMe
             packet["input"]["context"]["images"] = all_images
         packet["input"]["user_inputs"]["inputs"].append({"user_query": user_query_payload})
         return
-    if last.role == "tool" and last.tool_call_id:
-        packet["input"]["user_inputs"]["inputs"].append({
-            "tool_call_result": {
-                "tool_call_id": last.tool_call_id,
-                "call_mcp_tool": {
-                    "success": {"results": segments_to_warp_results(normalize_content_to_list(last.content))}
-                },
-            }
-        })
+    if last.role == "tool":
+        # 收集尾部所有连续的 tool_result（Claude Code 可能一次调多个工具）
+        tool_start = len(history)
+        while tool_start > 0 and history[tool_start - 1].role == "tool":
+            tool_start -= 1
+        tool_results = history[tool_start:]
+        for tr in tool_results:
+            if tr.tool_call_id:
+                packet["input"]["user_inputs"]["inputs"].append({
+                    "tool_call_result": {
+                        "tool_call_id": tr.tool_call_id,
+                        "call_mcp_tool": {
+                            "success": {"results": segments_to_warp_results(normalize_content_to_list(tr.content))}
+                        },
+                    }
+                })
         return
     # If neither, raise to catch protocol violations
     raise ValueError("post-reorder 最后一条必须是 user 或 tool 结果") 

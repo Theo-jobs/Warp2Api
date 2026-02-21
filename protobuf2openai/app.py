@@ -303,18 +303,10 @@ async def _on_startup():
     # 不再启动时自动刷新，避免 Firebase 限流
     logger.info("[OpenAI Compat] Token 批量刷新已关闭自动启动，如需刷新请调用 POST /api/tokens/refresh")
 
+    # 启动后台预刷新：每 5 分钟检查即将过期的 token，提前 10 分钟刷新
+    # 这是轻量级的，只刷新快到期的，不会一次性刷新所有账号
+    token_mgr = TokenManager.get_instance(ACCOUNT_DB_PATH)
+    token_mgr.start_background_refresh()
 
-async def _periodic_token_refresh() -> None:
-    """后台定时刷新所有账号 token，每 50 分钟一轮。"""
-    interval = 50 * 60  # 50 分钟
-    while True:
-        await asyncio.sleep(interval)
-        try:
-            token_mgr = TokenManager.get_instance(ACCOUNT_DB_PATH)
-            stats = await token_mgr.batch_refresh_all()
-            logger.info(
-                "[TokenRefresh] 定时刷新完成: refreshed=%d failed=%d skipped=%d",
-                stats["refreshed"], stats["failed"], stats["skipped"],
-            )
-        except Exception as e:
-            logger.error("[TokenRefresh] 定时刷新异常: %s", e) 
+
+# 旧的全量定时刷新已废弃，由 TokenManager.start_background_refresh() 替代

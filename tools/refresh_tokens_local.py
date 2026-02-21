@@ -29,6 +29,7 @@ from warp2protobuf.core.auth import (
     is_token_expired,
     refresh_access_token_with_refresh_token,
     _mask_token,
+    decode_jwt_payload,
 )
 
 
@@ -81,11 +82,13 @@ async def refresh_all_tokens(
             if not new_token:
                 raise RuntimeError("返回空 token")
 
-            # 回写 DB
+            # 回写 DB（含 token_expires_at）
             now = time.strftime("%Y-%m-%dT%H:%M:%S")
+            payload = decode_jwt_payload(new_token)
+            expires_at = float(payload.get("exp", 0))
             conn.execute(
-                "UPDATE accounts SET id_token = ?, last_refresh_time = ?, updated_at = ? WHERE id = ?",
-                (new_token, now, now, account_id),
+                "UPDATE accounts SET id_token = ?, token_expires_at = ?, last_refresh_time = ?, updated_at = ? WHERE id = ?",
+                (new_token, expires_at, now, now, account_id),
             )
             conn.commit()
 

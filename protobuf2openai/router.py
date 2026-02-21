@@ -108,45 +108,56 @@ async def chat_completions(req: ChatCompletionsRequest, request: Request = None)
     if request:
         await authenticate_request(request)
 
-    # 使用账号上下文管理账号分配与使用追踪
+    # 选择账号
+    from warp2protobuf.core.account_selector import AccountSelector
+    selector = AccountSelector(ACCOUNT_DB_PATH)
+    account = selector.select_account()
+
+    if not account:
+        raise HTTPException(503, "No available account with remaining quota")
+
+    account_id = account["id"]
+    account_info = {
+        "id": account["id"],
+        "email": account["email"],
+        "local_id": account["local_id"],
+        "use_count": account["use_count"],
+        "remaining_limit": account["total_limit"] - account["used_limit"],
+    }
+
+    # 临时设置当前账号的 JWT token
+    original_jwt = os.environ.get("WARP_JWT", "")
+    os.environ["WARP_JWT"] = account.get("id_token", "")
+
+    logger.info(
+        "[OpenAI Compat] Using account: id=%d email=%s remaining=%d",
+        account_info["id"],
+        account_info["email"],
+        account_info["remaining_limit"],
+    )
+
     try:
-        with AccountContext(ACCOUNT_DB_PATH) as account_ctx:
-            # 临时设置当前账号的 JWT token
-            original_jwt = os.environ.get("WARP_JWT", "")
-            os.environ["WARP_JWT"] = account_ctx.get_id_token()
+        initialize_once()
+    except Exception as e:
+        logger.warning(f"[OpenAI Compat] initialize_once failed or skipped: {e}")
 
-            try:
-                initialize_once()
-            except Exception as e:
-                logger.warning(f"[OpenAI Compat] initialize_once failed or skipped: {e}")
+    if not req.messages:
+        raise HTTPException(400, "messages 不能为空")
 
-            if not req.messages:
-                raise HTTPException(400, "messages 不能为空")
+    # 1) 生产环境避免打印完整请求体，防止敏感信息泄露
+    try:
+        logger.info(
+            "[OpenAI Compat] 接收到 Chat Completions 请求: model=%s stream=%s messages=%d tools=%d",
+            req.model,
+            req.stream,
+            len(req.messages or []),
+            len(req.tools or []),
+        )
+    except Exception:
+        logger.info("[OpenAI Compat] 接收到 Chat Completions 请求（摘要日志失败）")
 
-            # 记录当前使用的账号
-            account_info = account_ctx.get_account_info()
-            logger.info(
-                "[OpenAI Compat] Using account: id=%d email=%s remaining=%d",
-                account_info["id"],
-                account_info["email"],
-                account_info["remaining_limit"],
-            )
-
-            # 1) 生产环境避免打印完整请求体，防止敏感信息泄露
-            try:
-                logger.info(
-                    "[OpenAI Compat] 接收到 Chat Completions 请求: model=%s stream=%s messages=%d tools=%d",
-                    req.model,
-                    req.stream,
-                    len(req.messages or []),
-                    len(req.tools or []),
-                )
-            except Exception:
-                logger.info("[OpenAI Compat] 接收到 Chat Completions 请求（摘要日志失败）")
-
-            # ... 继续原有逻辑 ...
-            # 整理消息
-            history: List[ChatMessage] = reorder_messages_for_anthropic(list(req.messages))
+    # 整理消息
+    history: List[ChatMessage] = reorder_messages_for_anthropic(list(req.messages))
 
     # 2) 仅记录整理后的摘要，避免日志落地完整上下文
     try:
@@ -305,26 +316,21 @@ async def chat_completions(req: ChatCompletionsRequest, request: Request = None)
         "choices": [{"index": 0, "message": msg_payload, "finish_reason": finish_reason}],
     }
 
-            # 提取 token 消耗并更新账号额度
-            try:
-                request_cost = bridge_resp.get("request_cost", 0)
-                if isinstance(request_cost, (int, float)) and request_cost > 0:
-                    tokens_used = int(request_cost)
-                    account_ctx.set_tokens_used(tokens_used)
-                    logger.info(
-                        "[OpenAI Compat] Request cost: %d tokens, account_id=%d",
-                        tokens_used,
-                        account_info["id"],
-                    )
-            except Exception as e:
-                logger.warning("[OpenAI Compat] Failed to extract token cost: %s", e)
-
-            # 恢复原 JWT
-            os.environ["WARP_JWT"] = original_jwt
-
-            return final
+    # 提取 token 消耗并更新账号额度
+    try:
+        request_cost = bridge_resp.get("request_cost", 0)
+        if isinstance(request_cost, (int, float)) and request_cost > 0:
+            tokens_used = int(request_cost)
+            selector.record_usage(account_id, tokens_used)
+            logger.info(
+                "[OpenAI Compat] Request cost: %d tokens, account_id=%d",
+                tokens_used,
+                account_id,
+            )
     except Exception as e:
-        # 确保异常时也恢复 JWT
-        if 'original_jwt' in locals():
-            os.environ["WARP_JWT"] = original_jwt
-        raise 
+        logger.warning("[OpenAI Compat] Failed to extract token cost: %s", e)
+
+    # 恢复原 JWT
+    os.environ["WARP_JWT"] = original_jwt
+
+    return final 

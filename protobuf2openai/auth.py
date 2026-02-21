@@ -114,3 +114,20 @@ def require_auth(func):
         return await func(*args, **kwargs)
 
     return wrapper
+
+
+async def verify_admin_token(request: Request) -> None:
+    """
+    FastAPI Depends 依赖：校验 API_TOKEN，用于保护管理接口。
+
+    使用示例：
+        @app.get("/api/accounts", dependencies=[Depends(verify_admin_token)])
+        async def list_accounts(): ...
+    """
+    authorization = request.headers.get("authorization") or request.headers.get("Authorization")
+    if not auth.authenticate(authorization):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Admin API requires valid API_TOKEN",
+            headers={"WWW-Authenticate": "Bearer"},
+        )

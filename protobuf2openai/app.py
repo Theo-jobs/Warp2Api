@@ -8,7 +8,7 @@ from pathlib import Path
 
 import httpx
 import psutil
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Depends
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -18,6 +18,8 @@ from .logging import logger
 from .config import BRIDGE_BASE_URL, WARMUP_INIT_RETRIES, WARMUP_INIT_DELAY_S
 from .bridge import initialize_once
 from .router import router
+from .token_manager import TokenManager
+from .auth import verify_admin_token
 
 # 导入账号管理模块
 from warp2protobuf.config.settings import ACCOUNT_DB_PATH, ACCOUNT_ADMIN_ENABLED
@@ -55,7 +57,7 @@ class UpdateLimitRequest(BaseModel):
     used_limit: int
 
 
-@app.get("/api/accounts")
+@app.get("/api/accounts", dependencies=[Depends(verify_admin_token)])
 async def list_accounts(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
@@ -78,7 +80,7 @@ async def list_accounts(
     }
 
 
-@app.get("/api/accounts/summary")
+@app.get("/api/accounts/summary", dependencies=[Depends(verify_admin_token)])
 async def get_accounts_summary():
     """获取账号汇总统计"""
     if not ACCOUNT_ADMIN_ENABLED:
@@ -93,7 +95,7 @@ async def get_accounts_summary():
     }
 
 
-@app.patch("/api/accounts/{account_id}/limit")
+@app.patch("/api/accounts/{account_id}/limit", dependencies=[Depends(verify_admin_token)])
 async def update_account_limit(account_id: int, request: UpdateLimitRequest):
     """更新账号额度"""
     if not ACCOUNT_ADMIN_ENABLED:
@@ -111,7 +113,7 @@ async def update_account_limit(account_id: int, request: UpdateLimitRequest):
     }
 
 
-@app.get("/api/accounts/pool/status")
+@app.get("/api/accounts/pool/status", dependencies=[Depends(verify_admin_token)])
 async def get_pool_status():
     """获取账号池实时状态"""
     if not ACCOUNT_ADMIN_ENABLED:
@@ -126,7 +128,7 @@ async def get_pool_status():
     }
 
 
-@app.post("/api/accounts/{account_id}/record-usage")
+@app.post("/api/accounts/{account_id}/record-usage", dependencies=[Depends(verify_admin_token)])
 async def record_account_usage(account_id: int, tokens: int = 0):
     """手动记录账号使用（测试用）"""
     if not ACCOUNT_ADMIN_ENABLED:
@@ -144,7 +146,7 @@ async def record_account_usage(account_id: int, tokens: int = 0):
     }
 
 
-@app.get("/api/accounts/current")
+@app.get("/api/accounts/current", dependencies=[Depends(verify_admin_token)])
 async def get_current_account():
     """获取最近使用的账号（替代当前账号）"""
     if not ACCOUNT_ADMIN_ENABLED:
@@ -166,7 +168,7 @@ async def get_current_account():
     }
 
 
-@app.get("/api/accounts/{account_id}")
+@app.get("/api/accounts/{account_id}", dependencies=[Depends(verify_admin_token)])
 async def get_account_detail(account_id: int):
     """获取单个账号详情"""
     if not ACCOUNT_ADMIN_ENABLED:
@@ -184,7 +186,7 @@ async def get_account_detail(account_id: int):
     }
 
 
-@app.get("/api/accounts/recent")
+@app.get("/api/accounts/recent", dependencies=[Depends(verify_admin_token)])
 async def get_recent_accounts():
     """获取最近使用的账号列表"""
     if not ACCOUNT_ADMIN_ENABLED:
@@ -197,6 +199,22 @@ async def get_recent_accounts():
         "success": True,
         "accounts": recent,
         "total": len(recent),
+    }
+
+
+@app.post("/api/tokens/refresh", dependencies=[Depends(verify_admin_token)])
+async def manual_token_refresh():
+    """手动触发全量 Token 刷新"""
+    if not ACCOUNT_ADMIN_ENABLED:
+        raise HTTPException(status_code=403, detail="Account management is disabled")
+
+    token_mgr = TokenManager.get_instance(ACCOUNT_DB_PATH)
+    stats = await token_mgr.batch_refresh_all()
+
+    return {
+        "success": True,
+        "message": "Token refresh completed",
+        "stats": stats,
     }
 
 
@@ -279,4 +297,34 @@ async def _on_startup():
     try:
         await asyncio.to_thread(initialize_once)
     except Exception as e:
-        logger.warning(f"[OpenAI Compat] Warmup initialize_once on startup failed: {e}") 
+        logger.warning(f"[OpenAI Compat] Warmup initialize_once on startup failed: {e}")
+
+    # 启动时批量刷新所有账号 token
+    try:
+        token_mgr = TokenManager.get_instance(ACCOUNT_DB_PATH)
+        stats = await token_mgr.batch_refresh_all()
+        logger.info(
+            "[OpenAI Compat] 启动 Token 批量刷新完成: refreshed=%d failed=%d skipped=%d",
+            stats["refreshed"], stats["failed"], stats["skipped"],
+        )
+    except Exception as e:
+        logger.warning(f"[OpenAI Compat] 启动 Token 批量刷新失败: {e}")
+
+    # 启动后台定时刷新（每 50 分钟）
+    asyncio.create_task(_periodic_token_refresh())
+
+
+async def _periodic_token_refresh() -> None:
+    """后台定时刷新所有账号 token，每 50 分钟一轮。"""
+    interval = 50 * 60  # 50 分钟
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            token_mgr = TokenManager.get_instance(ACCOUNT_DB_PATH)
+            stats = await token_mgr.batch_refresh_all()
+            logger.info(
+                "[TokenRefresh] 定时刷新完成: refreshed=%d failed=%d skipped=%d",
+                stats["refreshed"], stats["failed"], stats["skipped"],
+            )
+        except Exception as e:
+            logger.error("[TokenRefresh] 定时刷新异常: %s", e) 

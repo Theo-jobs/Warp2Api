@@ -23,6 +23,7 @@ from .config import BRIDGE_BASE_URL
 from .bridge import initialize_once
 from .sse_transform import stream_openai_sse
 from .auth import authenticate_request
+from .token_manager import TokenManager
 
 from warp2protobuf.config.models import resolve_model, get_all_unique_models as _get_all_models
 from warp2protobuf.config.settings import ACCOUNT_DB_PATH
@@ -108,13 +109,36 @@ async def chat_completions(req: ChatCompletionsRequest, request: Request = None)
     if request:
         await authenticate_request(request)
 
-    # 选择账号
+    # 选择账号并获取有效 token
     from warp2protobuf.core.account_selector import AccountSelector
     selector = AccountSelector(ACCOUNT_DB_PATH)
-    account = selector.select_account()
+    token_mgr = TokenManager.get_instance(ACCOUNT_DB_PATH)
 
+    account = selector.select_account()
     if not account:
         raise HTTPException(503, "No available account with remaining quota")
+
+    # 获取有效 token（过期自动刷新）
+    valid_token = await token_mgr.get_valid_token(account)
+
+    # 如果当前账号 token 刷新失败，尝试换号（最多 3 次）
+    _tried_ids = {account["id"]}
+    for _retry in range(3):
+        if valid_token:
+            break
+        logger.warning(
+            "[OpenAI Compat] account_id=%d token 无效，尝试换号 (%d/3)",
+            account["id"], _retry + 1,
+        )
+        token_mgr.mark_account_failed(account["id"])
+        account = selector.select_account()
+        if not account or account["id"] in _tried_ids:
+            break
+        _tried_ids.add(account["id"])
+        valid_token = await token_mgr.get_valid_token(account)
+
+    if not valid_token or not account:
+        raise HTTPException(503, "No account with valid token available")
 
     account_id = account["id"]
     account_info = {
@@ -125,16 +149,17 @@ async def chat_completions(req: ChatCompletionsRequest, request: Request = None)
         "remaining_limit": account["total_limit"] - account["used_limit"],
     }
 
-    # 临时设置当前账号的 JWT token
-    original_jwt = os.environ.get("WARP_JWT", "")
-    os.environ["WARP_JWT"] = account.get("id_token", "")
-
     logger.info(
         "[OpenAI Compat] Using account: id=%d email=%s remaining=%d",
         account_info["id"],
         account_info["email"],
         account_info["remaining_limit"],
     )
+
+    # 在锁保护下设置 JWT 并初始化
+    async with token_mgr.env_lock:
+        original_jwt = os.environ.get("WARP_JWT", "")
+        os.environ["WARP_JWT"] = valid_token
 
     try:
         initialize_once()
@@ -235,10 +260,32 @@ async def chat_completions(req: ChatCompletionsRequest, request: Request = None)
 
     if req.stream:
         async def _agen():
-            async for chunk in stream_openai_sse(packet, completion_id, created_ts, model_id):
-                yield chunk
+            # 在锁保护下设置 JWT
+            async with token_mgr.env_lock:
+                os.environ["WARP_JWT"] = valid_token
+            try:
+                async for chunk in stream_openai_sse(packet, completion_id, created_ts, model_id):
+                    yield chunk
+                # 流式成功，记录使用
+                selector.record_usage(account_id, 1)
+            except RuntimeError as e:
+                err_msg = str(e)
+                if "429" in err_msg:
+                    token_mgr.mark_account_failed(account_id)
+                    logger.warning("[OpenAI Compat] Stream 429, account_id=%d marked failed", account_id)
+                # 将错误作为 SSE 事件发送给客户端
+                error_chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_ts,
+                    "model": model_id,
+                    "choices": [{"index": 0, "delta": {"content": f"\n\n[Error: {err_msg}]"}, "finish_reason": "stop"}],
+                }
+                yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
         return StreamingResponse(_agen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
+    # 非流式请求
     def _post_once() -> requests.Response:
         return requests.post(
             f"{BRIDGE_BASE_URL}/api/warp/send_stream",
@@ -247,17 +294,30 @@ async def chat_completions(req: ChatCompletionsRequest, request: Request = None)
         )
 
     try:
+        # 在锁保护下设置 JWT 并发送请求
+        async with token_mgr.env_lock:
+            os.environ["WARP_JWT"] = valid_token
         resp = _post_once()
+
         if resp.status_code == 429:
-            try:
-                r = requests.post(f"{BRIDGE_BASE_URL}/api/auth/refresh", timeout=10.0)
-                logger.warning("[OpenAI Compat] Bridge returned 429. Tried JWT refresh -> HTTP %s", getattr(r, 'status_code', 'N/A'))
-            except Exception as _e:
-                logger.warning("[OpenAI Compat] JWT refresh attempt failed after 429: %s", _e)
-            resp = _post_once()
+            # 标记当前账号失败，尝试换号重试
+            token_mgr.mark_account_failed(account_id)
+            logger.warning("[OpenAI Compat] 429 from bridge, switching account...")
+
+            retry_account = selector.select_account()
+            if retry_account and retry_account["id"] != account_id:
+                retry_token = await token_mgr.get_valid_token(retry_account)
+                if retry_token:
+                    async with token_mgr.env_lock:
+                        os.environ["WARP_JWT"] = retry_token
+                    resp = _post_once()
+                    account_id = retry_account["id"]
+
         if resp.status_code != 200:
             raise HTTPException(resp.status_code, f"bridge_error: {resp.text}")
         bridge_resp = resp.json()
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(502, f"bridge_unreachable: {e}")
 
@@ -329,8 +389,5 @@ async def chat_completions(req: ChatCompletionsRequest, request: Request = None)
             )
     except Exception as e:
         logger.warning("[OpenAI Compat] Failed to extract token cost: %s", e)
-
-    # 恢复原 JWT
-    os.environ["WARP_JWT"] = original_jwt
 
     return final 

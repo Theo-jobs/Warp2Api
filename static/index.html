@@ -143,10 +143,12 @@
         </div>
 
         <div class="card" style="margin-bottom: 20px;">
-            <div class="card-title">当前使用账号</div>
+            <div class="card-title">最近使用账号</div>
             <div id="current-account" style="margin-top: 10px; font-size: 14px; color: #333;">
                 <div id="current-email" style="font-weight: 600; margin-bottom: 4px;">-</div>
                 <div id="current-info" style="color: #666; font-size: 12px;">-</div>
+            </div>
+        </div>
             </div>
         </div>
 
@@ -210,7 +212,7 @@
 
         async function loadSummary() {
             try {
-                // 同时获取基础汇总、账号池状态和当前账号
+                // 同时获取基础汇总、账号池状态和最近使用账号
                 const [summaryResp, poolResp, currentResp] = await Promise.all([
                     fetch('/api/accounts/summary'),
                     fetch('/api/accounts/pool/status'),
@@ -225,6 +227,36 @@
                     const summary = summaryData.summary;
                     document.getElementById('total-count').textContent = summary.total_count;
                     document.getElementById('available-count').textContent = summary.status_counts.available || 0;
+                    document.getElementById('total-limit').textContent = summary.total_limit;
+                    document.getElementById('used-limit').textContent = summary.used_limit;
+                    document.getElementById('remaining-limit').textContent = summary.remaining_limit;
+
+                    const usagePercent = summary.total_limit > 0
+                        ? ((summary.used_limit / summary.total_limit) * 100).toFixed(1)
+                        : 0;
+                    document.getElementById('usage-percent').textContent = `使用率 ${usagePercent}%`;
+                }
+
+                if (poolData.success) {
+                    const pool = poolData.status;
+                    document.getElementById('exhausted-count').textContent =
+                        `额度耗尽: ${pool.exhausted}`;
+                }
+
+                // 显示最近使用的账号
+                if (currentData.success && currentData.account) {
+                    const acc = currentData.account;
+                    document.getElementById('current-email').textContent = acc.email;
+                    document.getElementById('current-info').textContent =
+                        `使用 ${acc.use_count} 次 | 剩余 ${acc.remaining_limit} | 最后使用: ${acc.last_used || '未使用'}`;
+                } else {
+                    document.getElementById('current-email').textContent = '暂无使用记录';
+                    document.getElementById('current-info').textContent = '-';
+                }
+            } catch (error) {
+                showError('加载汇总数据失败: ' + error.message);
+            }
+        }
                     document.getElementById('total-limit').textContent = summary.total_limit;
                     document.getElementById('used-limit').textContent = summary.used_limit;
                     document.getElementById('remaining-limit').textContent = summary.remaining_limit;

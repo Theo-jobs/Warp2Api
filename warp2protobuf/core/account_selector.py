@@ -106,6 +106,36 @@ class AccountSelector:
 
             return success
 
+    def get_recently_used_accounts(self, limit: int = 10) -> list:
+        """
+        获取最近使用的账号列表
+
+        Args:
+            limit: 返回数量
+
+        Returns:
+            账号列表（脱敏）
+        """
+        import sqlite3
+
+        with sqlite3.connect(str(self.store.db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+
+            cursor.execute("""
+                SELECT
+                    id, email, local_id, use_count, last_used,
+                    total_limit, used_limit,
+                    (total_limit - used_limit) as remaining_limit
+                FROM accounts
+                WHERE last_used IS NOT NULL
+                ORDER BY last_used DESC
+                LIMIT ?
+            """, (limit,))
+
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+
     def get_pool_status(self) -> Dict:
         """
         获取账号池状态

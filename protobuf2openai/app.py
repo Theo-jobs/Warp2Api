@@ -158,21 +158,39 @@ async def record_account_usage(account_id: int, tokens: int = 0):
 
 @app.get("/api/accounts/current")
 async def get_current_account():
-    """获取当前请求正在使用的账号信息（脱敏）"""
-    from warp2protobuf.core.account_context import get_current_account_info
+    """获取最近使用的账号（替代当前账号）"""
+    if not ACCOUNT_ADMIN_ENABLED:
+        raise HTTPException(status_code=403, detail="Account management is disabled")
 
-    account_info = get_current_account_info()
+    selector = AccountSelector(ACCOUNT_DB_PATH)
+    recent = selector.get_recently_used_accounts(limit=1)
 
-    if not account_info:
+    if not recent:
         return {
             "success": False,
-            "message": "No account is currently in use",
+            "message": "No account has been used yet",
             "account": None,
         }
 
     return {
         "success": True,
-        "account": account_info,
+        "account": recent[0],
+    }
+
+
+@app.get("/api/accounts/recent")
+async def get_recent_accounts():
+    """获取最近使用的账号列表"""
+    if not ACCOUNT_ADMIN_ENABLED:
+        raise HTTPException(status_code=403, detail="Account management is disabled")
+
+    selector = AccountSelector(ACCOUNT_DB_PATH)
+    recent = selector.get_recently_used_accounts(limit=10)
+
+    return {
+        "success": True,
+        "accounts": recent,
+        "total": len(recent),
     }
 
 

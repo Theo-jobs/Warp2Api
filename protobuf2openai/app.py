@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import time
 from pathlib import Path
 
 import httpx
+import psutil
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -20,6 +23,9 @@ from .router import router
 from warp2protobuf.config.settings import ACCOUNT_DB_PATH, ACCOUNT_ADMIN_ENABLED
 from warp2protobuf.core.account_store import AccountStore
 from warp2protobuf.core.account_selector import AccountSelector
+
+# 记录启动时间
+_START_TIME = time.time()
 
 
 app = FastAPI(title="OpenAI Chat Completions (Warp bridge) - Streaming")
@@ -192,6 +198,56 @@ async def get_recent_accounts():
         "accounts": recent,
         "total": len(recent),
     }
+
+
+@app.get("/api/system/stats")
+async def get_system_stats():
+    """获取系统监控信息"""
+    try:
+        process = psutil.Process(os.getpid())
+
+        # CPU 使用率（需要间隔测量）
+        cpu_percent = process.cpu_percent(interval=0.1)
+
+        # 内存信息
+        memory_info = process.memory_info()
+        memory_mb = memory_info.rss / 1024 / 1024
+
+        # 系统总内存
+        system_memory = psutil.virtual_memory()
+
+        # 运行时间
+        uptime_seconds = time.time() - _START_TIME
+        uptime_hours = uptime_seconds / 3600
+
+        # 线程数
+        num_threads = process.num_threads()
+
+        return {
+            "success": True,
+            "stats": {
+                "process": {
+                    "pid": os.getpid(),
+                    "cpu_percent": round(cpu_percent, 2),
+                    "memory_mb": round(memory_mb, 2),
+                    "memory_percent": round(process.memory_percent(), 2),
+                    "num_threads": num_threads,
+                    "uptime_seconds": round(uptime_seconds, 2),
+                    "uptime_hours": round(uptime_hours, 2),
+                },
+                "system": {
+                    "cpu_count": psutil.cpu_count(),
+                    "memory_total_gb": round(system_memory.total / 1024 / 1024 / 1024, 2),
+                    "memory_available_gb": round(system_memory.available / 1024 / 1024 / 1024, 2),
+                    "memory_percent": round(system_memory.percent, 2),
+                }
+            }
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 
 @app.on_event("startup")

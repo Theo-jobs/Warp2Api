@@ -19,6 +19,7 @@ from .router import router
 # 导入账号管理模块
 from warp2protobuf.config.settings import ACCOUNT_DB_PATH, ACCOUNT_ADMIN_ENABLED
 from warp2protobuf.core.account_store import AccountStore
+from warp2protobuf.core.account_selector import AccountSelector
 
 
 app = FastAPI(title="OpenAI Chat Completions (Warp bridge) - Streaming")
@@ -119,6 +120,39 @@ async def update_account_limit(account_id: int, request: UpdateLimitRequest):
     return {
         "success": True,
         "message": "Limit updated successfully",
+    }
+
+
+@app.get("/api/accounts/pool/status")
+async def get_pool_status():
+    """获取账号池实时状态"""
+    if not ACCOUNT_ADMIN_ENABLED:
+        raise HTTPException(status_code=403, detail="Account management is disabled")
+
+    selector = AccountSelector(ACCOUNT_DB_PATH)
+    status = selector.get_pool_status()
+
+    return {
+        "success": True,
+        "status": status,
+    }
+
+
+@app.post("/api/accounts/{account_id}/record-usage")
+async def record_account_usage(account_id: int, tokens: int = 0):
+    """手动记录账号使用（测试用）"""
+    if not ACCOUNT_ADMIN_ENABLED:
+        raise HTTPException(status_code=403, detail="Account management is disabled")
+
+    selector = AccountSelector(ACCOUNT_DB_PATH)
+    success = selector.record_usage(account_id, tokens)
+
+    if not success:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    return {
+        "success": True,
+        "message": f"Recorded {tokens} tokens usage",
     }
 
 

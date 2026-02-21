@@ -125,6 +125,7 @@
             <div class="card">
                 <div class="card-title">可用账号</div>
                 <div class="card-value" id="available-count">-</div>
+                <div class="card-subtitle" id="exhausted-count">-</div>
             </div>
             <div class="card">
                 <div class="card-title">总额度</div>
@@ -181,11 +182,17 @@
 
         async function loadSummary() {
             try {
-                const response = await fetch('/api/accounts/summary');
-                const data = await response.json();
+                // 同时获取基础汇总和账号池状态
+                const [summaryResp, poolResp] = await Promise.all([
+                    fetch('/api/accounts/summary'),
+                    fetch('/api/accounts/pool/status')
+                ]);
 
-                if (data.success) {
-                    const summary = data.summary;
+                const summaryData = await summaryResp.json();
+                const poolData = await poolResp.json();
+
+                if (summaryData.success) {
+                    const summary = summaryData.summary;
                     document.getElementById('total-count').textContent = summary.total_count;
                     document.getElementById('available-count').textContent = summary.status_counts.available || 0;
                     document.getElementById('total-limit').textContent = summary.total_limit;
@@ -196,6 +203,12 @@
                         ? ((summary.used_limit / summary.total_limit) * 100).toFixed(1)
                         : 0;
                     document.getElementById('usage-percent').textContent = `使用率 ${usagePercent}%`;
+                }
+
+                if (poolData.success) {
+                    const pool = poolData.status;
+                    document.getElementById('exhausted-count').textContent =
+                        `额度耗尽: ${pool.exhausted}`;
                 }
             } catch (error) {
                 showError('加载汇总数据失败: ' + error.message);
@@ -294,6 +307,9 @@
         document.getElementById('keyword').addEventListener('keypress', (e) => {
             if (e.key === 'Enter') loadAccounts();
         });
+
+        // 自动刷新汇总数据（每 30 秒）
+        setInterval(loadSummary, 30000);
     </script>
 </body>
 </html>

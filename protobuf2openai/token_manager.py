@@ -168,23 +168,42 @@ class TokenManager:
                 stats["failed"] += 1
                 continue
 
-            try:
-                new_token = await refresh_access_token_with_refresh_token(refresh_token)
-                if new_token:
-                    self._update_token_in_db(account_id, new_token)
-                    stats["refreshed"] += 1
-                else:
-                    stats["failed"] += 1
-            except Exception as exc:
-                logger.warning(
-                    "[TokenManager] 批量刷新 account_id=%d 失败: %s",
-                    account_id,
-                    exc,
-                )
+            # 带重试的刷新（Firebase 限流时指数退避）
+            success = False
+            for attempt in range(3):
+                try:
+                    new_token = await refresh_access_token_with_refresh_token(refresh_token)
+                    if new_token:
+                        self._update_token_in_db(account_id, new_token)
+                        stats["refreshed"] += 1
+                        success = True
+                        break
+                    else:
+                        stats["failed"] += 1
+                        break
+                except Exception as exc:
+                    err_msg = str(exc)
+                    if "429" in err_msg:
+                        # Firebase 限流，指数退避等待
+                        wait = (attempt + 1) * 5  # 5s, 10s, 15s
+                        logger.warning(
+                            "[TokenManager] account_id=%d Firebase 限流，等待 %ds 后重试 (%d/3)",
+                            account_id, wait, attempt + 1,
+                        )
+                        await asyncio.sleep(wait)
+                    else:
+                        logger.warning(
+                            "[TokenManager] 批量刷新 account_id=%d 失败: %s",
+                            account_id, exc,
+                        )
+                        stats["failed"] += 1
+                        break
+
+            if not success and attempt == 2:
                 stats["failed"] += 1
 
-            # 每个账号间隔 0.5s，避免被 Firebase 限流
-            await asyncio.sleep(0.5)
+            # 每个账号间隔 3 秒，避免被 Firebase 限流
+            await asyncio.sleep(3)
 
         logger.info(
             "[TokenManager] 批量刷新完成: total=%d refreshed=%d failed=%d skipped=%d",

@@ -210,13 +210,50 @@
         let currentPage = 1;
         const pageSize = 20;
 
+        // Token 鉴权管理
+        function getApiToken() {
+            return localStorage.getItem('api_token') || '';
+        }
+        function setApiToken(token) {
+            localStorage.setItem('api_token', token);
+        }
+        async function authFetch(url, options = {}) {
+            const token = getApiToken();
+            if (!token) {
+                promptToken();
+                throw new Error('请先输入 API Token');
+            }
+            options.headers = {
+                ...(options.headers || {}),
+                'Authorization': `Bearer ${token}`,
+            };
+            const resp = await fetch(url, options);
+            if (resp.status === 401) {
+                localStorage.removeItem('api_token');
+                promptToken();
+                throw new Error('Token 无效，请重新输入');
+            }
+            return resp;
+        }
+        function promptToken() {
+            const token = prompt('请输入 API Token (API_TOKEN):', getApiToken());
+            if (token) {
+                setApiToken(token);
+                location.reload();
+            }
+        }
+        // 页面加载时检查 token
+        if (!getApiToken()) {
+            promptToken();
+        }
+
         async function loadSummary() {
             try {
                 // 同时获取基础汇总、账号池状态和最近使用账号
                 const [summaryResp, poolResp, currentResp] = await Promise.all([
-                    fetch('/api/accounts/summary'),
-                    fetch('/api/accounts/pool/status'),
-                    fetch('/api/accounts/current')
+                    authFetch('/api/accounts/summary'),
+                    authFetch('/api/accounts/pool/status'),
+                    authFetch('/api/accounts/current')
                 ]);
 
                 const summaryData = await summaryResp.json();
@@ -275,7 +312,7 @@
                 if (keyword) params.append('keyword', keyword);
                 if (status) params.append('status', status);
 
-                const response = await fetch(`/api/accounts?${params}`);
+                const response = await authFetch(`/api/accounts?${params}`);
                 const data = await response.json();
 
                 renderAccounts(data.accounts);
@@ -295,7 +332,7 @@
             document.getElementById('recent-table').style.display = 'none';
 
             try {
-                const response = await fetch('/api/accounts?page_size=10&sort=last_used_desc');
+                const response = await authFetch('/api/accounts?page_size=10&sort=last_used_desc');
                 const data = await response.json();
 
                 if (data.success && data.accounts) {

@@ -27,12 +27,16 @@ class TokenManager:
     _instance: Optional["TokenManager"] = None
     _lock: asyncio.Lock  # 全局锁，保护 os.environ["WARP_JWT"]
 
+    # 全局 Firebase 限流标记（类级别，所有实例共享）
+    _firebase_blocked_until: float = 0.0
+    _FIREBASE_COOLDOWN = 1800  # Firebase 限流后全局冷却 30 分钟
+
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
         self._lock = asyncio.Lock()
         # 记录最近刷新失败的账号 ID → 失败时间戳，短期内不再重试
         self._refresh_failures: Dict[int, float] = {}
-        self._FAILURE_COOLDOWN = 300  # 刷新失败后 5 分钟冷却
+        self._FAILURE_COOLDOWN = 60  # 单账号刷新失败冷却缩短到 60s
 
     @classmethod
     def get_instance(cls, db_path: str) -> "TokenManager":
@@ -40,31 +44,59 @@ class TokenManager:
             cls._instance = cls(db_path)
         return cls._instance
 
+    @classmethod
+    def is_firebase_blocked(cls) -> bool:
+        """检查 Firebase 是否处于全局限流冷却期。"""
+        return time.time() < cls._firebase_blocked_until
+
+    @classmethod
+    def set_firebase_blocked(cls) -> None:
+        """标记 Firebase 全局限流，所有刷新暂停。"""
+        cls._firebase_blocked_until = time.time() + cls._FIREBASE_COOLDOWN
+        remaining = cls._FIREBASE_COOLDOWN // 60
+        logger.warning(
+            "[TokenManager] ⚠️ Firebase 全局限流已触发，%d 分钟内不再尝试任何 token 刷新",
+            remaining,
+        )
+
     async def get_valid_token(self, account: Dict) -> Optional[str]:
         """获取账号的有效 id_token，过期则自动刷新。
+
+        - Firebase 全局限流期间：直接返回已有 token（即使过期），不尝试刷新
+        - 单账号冷却期间：跳过该账号
+        - 正常情况：过期则刷新
 
         Args:
             account: 从 DB 查出的账号字典，需包含 id, id_token, refresh_token, email
 
         Returns:
-            有效的 id_token，刷新失败返回 None
+            有效的 id_token；刷新失败时返回已有 token（可能过期）或 None
         """
         account_id = account["id"]
         id_token = account.get("id_token", "")
         refresh_token = account.get("refresh_token", "")
 
-        # 检查是否在冷却期
-        fail_ts = self._refresh_failures.get(account_id, 0)
-        if fail_ts and (time.time() - fail_ts) < self._FAILURE_COOLDOWN:
-            logger.warning(
-                "[TokenManager] account_id=%d 在刷新冷却期，跳过",
-                account_id,
-            )
-            return None
-
         # token 未过期，直接返回
         if id_token and not is_token_expired(id_token, buffer_minutes=5):
             return id_token
+
+        # === Firebase 全局限流期间：返回已有 token，不刷新 ===
+        if self.is_firebase_blocked():
+            if id_token:
+                logger.debug(
+                    "[TokenManager] Firebase 限流中，account_id=%d 返回已有 token（可能过期）",
+                    account_id,
+                )
+                return id_token
+            return None
+
+        # 检查单账号冷却期
+        fail_ts = self._refresh_failures.get(account_id, 0)
+        if fail_ts and (time.time() - fail_ts) < self._FAILURE_COOLDOWN:
+            # 冷却期内也返回已有 token
+            if id_token:
+                return id_token
+            return None
 
         # token 过期或为空，需要刷新
         if not refresh_token:
@@ -72,7 +104,7 @@ class TokenManager:
                 "[TokenManager] account_id=%d 无 refresh_token，无法刷新",
                 account_id,
             )
-            return None
+            return id_token or None  # 返回已有的，哪怕过期
 
         logger.info(
             "[TokenManager] account_id=%d email=%s token 已过期，正在刷新...",
@@ -98,13 +130,20 @@ class TokenManager:
             return new_token
 
         except Exception as exc:
+            err_msg = str(exc)
             logger.error(
                 "[TokenManager] account_id=%d token 刷新失败: %s",
                 account_id,
                 exc,
             )
             self._refresh_failures[account_id] = time.time()
-            return None
+
+            # 检测 429 → 触发全局 Firebase 限流
+            if "429" in err_msg or "rate" in err_msg.lower():
+                self.set_firebase_blocked()
+
+            # 返回已有 token（过期也比 None 好，让 bridge 层尝试处理）
+            return id_token or None
 
     def _update_token_in_db(self, account_id: int, new_token: str) -> None:
         """将刷新后的 token 回写数据库。"""
@@ -137,12 +176,23 @@ class TokenManager:
         return self._lock
 
     async def batch_refresh_all(self) -> Dict[str, int]:
-        """批量预刷新所有账号的 token（启动时或定时调用）。
+        """批量预刷新所有账号的 token（手动触发）。
+
+        遇到 429 立即停止整个批量操作，触发全局限流保护。
 
         Returns:
             {"total": N, "refreshed": N, "failed": N, "skipped": N}
         """
         stats = {"total": 0, "refreshed": 0, "failed": 0, "skipped": 0}
+
+        # 全局限流期间拒绝批量刷新
+        if self.is_firebase_blocked():
+            remaining = int((self._firebase_blocked_until - time.time()) / 60)
+            logger.warning(
+                "[TokenManager] Firebase 全局限流中，批量刷新被拒绝，剩余冷却 %d 分钟",
+                remaining,
+            )
+            return stats
 
         with sqlite3.connect(str(self.db_path)) as conn:
             conn.row_factory = sqlite3.Row
@@ -154,6 +204,12 @@ class TokenManager:
         logger.info("[TokenManager] 开始批量刷新 %d 个账号...", len(rows))
 
         for row in rows:
+            # 每次循环检查全局限流
+            if self.is_firebase_blocked():
+                logger.warning("[TokenManager] 批量刷新中途触发限流，停止剩余账号")
+                stats["skipped"] += stats["total"] - stats["refreshed"] - stats["failed"] - stats["skipped"]
+                break
+
             account = dict(row)
             account_id = account["id"]
             id_token = account.get("id_token", "")
@@ -168,42 +224,32 @@ class TokenManager:
                 stats["failed"] += 1
                 continue
 
-            # 带重试的刷新（Firebase 限流时指数退避）
-            success = False
-            for attempt in range(3):
-                try:
-                    new_token = await refresh_access_token_with_refresh_token(refresh_token)
-                    if new_token:
-                        self._update_token_in_db(account_id, new_token)
-                        stats["refreshed"] += 1
-                        success = True
-                        break
-                    else:
-                        stats["failed"] += 1
-                        break
-                except Exception as exc:
-                    err_msg = str(exc)
-                    if "429" in err_msg:
-                        # Firebase 限流，指数退避等待
-                        wait = (attempt + 1) * 5  # 5s, 10s, 15s
-                        logger.warning(
-                            "[TokenManager] account_id=%d Firebase 限流，等待 %ds 后重试 (%d/3)",
-                            account_id, wait, attempt + 1,
-                        )
-                        await asyncio.sleep(wait)
-                    else:
-                        logger.warning(
-                            "[TokenManager] 批量刷新 account_id=%d 失败: %s",
-                            account_id, exc,
-                        )
-                        stats["failed"] += 1
-                        break
+            try:
+                new_token = await refresh_access_token_with_refresh_token(refresh_token)
+                if new_token:
+                    self._update_token_in_db(account_id, new_token)
+                    stats["refreshed"] += 1
+                else:
+                    stats["failed"] += 1
+            except Exception as exc:
+                err_msg = str(exc)
+                if "429" in err_msg or "rate" in err_msg.lower():
+                    # 429 → 立即停止，触发全局限流
+                    self.set_firebase_blocked()
+                    logger.error(
+                        "[TokenManager] 批量刷新遇到 429，立即停止。已刷新 %d 个",
+                        stats["refreshed"],
+                    )
+                    break
+                else:
+                    logger.warning(
+                        "[TokenManager] 批量刷新 account_id=%d 失败: %s",
+                        account_id, exc,
+                    )
+                    stats["failed"] += 1
 
-            if not success and attempt == 2:
-                stats["failed"] += 1
-
-            # 每个账号间隔 3 秒，避免被 Firebase 限流
-            await asyncio.sleep(3)
+            # 每个账号间隔 5 秒
+            await asyncio.sleep(5)
 
         logger.info(
             "[TokenManager] 批量刷新完成: total=%d refreshed=%d failed=%d skipped=%d",

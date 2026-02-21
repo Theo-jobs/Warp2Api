@@ -118,43 +118,60 @@ async def chat_completions(req: ChatCompletionsRequest, request: Request = None)
     if not account:
         raise HTTPException(503, "No available account with remaining quota")
 
-    # 获取有效 token（过期自动刷新）
+    # 获取有效 token（过期自动刷新；Firebase 限流时返回已有 token）
     valid_token = await token_mgr.get_valid_token(account)
 
-    # 如果当前账号 token 刷新失败，尝试换号（最多 3 次）
+    # 如果当前账号 token 完全为空，尝试换号（最多 2 次，减少 Firebase 压力）
     _tried_ids = {account["id"]}
-    for _retry in range(3):
+    for _retry in range(2):
         if valid_token:
             break
         logger.warning(
-            "[OpenAI Compat] account_id=%d token 无效，尝试换号 (%d/3)",
+            "[OpenAI Compat] account_id=%d token 为空，尝试换号 (%d/2)",
             account["id"], _retry + 1,
         )
-        token_mgr.mark_account_failed(account["id"])
         account = selector.select_account()
         if not account or account["id"] in _tried_ids:
             break
         _tried_ids.add(account["id"])
         valid_token = await token_mgr.get_valid_token(account)
 
-    if not valid_token or not account:
-        raise HTTPException(503, "No account with valid token available")
+    # === 回退机制：多账号全失败时，走原始单账号 get_valid_jwt() ===
+    _used_fallback = False
+    if not valid_token:
+        logger.warning(
+            "[OpenAI Compat] 所有账号 token 获取失败，回退到原始 get_valid_jwt() 机制"
+        )
+        try:
+            from warp2protobuf.core.auth import get_valid_jwt
+            valid_token = await get_valid_jwt()
+            _used_fallback = True
+            logger.info("[OpenAI Compat] 原始 get_valid_jwt() 回退成功")
+        except Exception as fallback_err:
+            logger.error(
+                "[OpenAI Compat] 原始 get_valid_jwt() 回退也失败: %s", fallback_err
+            )
 
-    account_id = account["id"]
-    account_info = {
-        "id": account["id"],
-        "email": account["email"],
-        "local_id": account["local_id"],
-        "use_count": account["use_count"],
-        "remaining_limit": account["total_limit"] - account["used_limit"],
-    }
+    if not valid_token:
+        raise HTTPException(503, "No account with valid token available (all refresh failed)")
 
-    logger.info(
-        "[OpenAI Compat] Using account: id=%d email=%s remaining=%d",
-        account_info["id"],
-        account_info["email"],
-        account_info["remaining_limit"],
-    )
+    account_id = account["id"] if account else 0
+    if account and not _used_fallback:
+        account_info = {
+            "id": account["id"],
+            "email": account["email"],
+            "local_id": account["local_id"],
+            "use_count": account["use_count"],
+            "remaining_limit": account["total_limit"] - account["used_limit"],
+        }
+        logger.info(
+            "[OpenAI Compat] Using account: id=%d email=%s remaining=%d",
+            account_info["id"],
+            account_info["email"],
+            account_info["remaining_limit"],
+        )
+    else:
+        logger.info("[OpenAI Compat] Using fallback JWT (original mechanism)")
 
     # 在锁保护下设置 JWT 并初始化
     async with token_mgr.env_lock:

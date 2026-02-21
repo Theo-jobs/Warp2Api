@@ -277,11 +277,8 @@ async def chat_completions(req: ChatCompletionsRequest, request: Request = None)
 
     if req.stream:
         async def _agen():
-            # 在锁保护下设置 JWT
-            async with token_mgr.env_lock:
-                os.environ["WARP_JWT"] = valid_token
             try:
-                async for chunk in stream_openai_sse(packet, completion_id, created_ts, model_id):
+                async for chunk in stream_openai_sse(packet, completion_id, created_ts, model_id, access_token=valid_token):
                     yield chunk
                 # 流式成功，记录使用
                 selector.record_usage(account_id, 1)
@@ -303,18 +300,19 @@ async def chat_completions(req: ChatCompletionsRequest, request: Request = None)
         return StreamingResponse(_agen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
     # 非流式请求
-    def _post_once() -> requests.Response:
+    def _post_once(_token: str) -> requests.Response:
         return requests.post(
             f"{BRIDGE_BASE_URL}/api/warp/send_stream",
-            json={"json_data": packet, "message_type": "warp.multi_agent.v1.Request"},
+            json={
+                "json_data": packet,
+                "message_type": "warp.multi_agent.v1.Request",
+                "access_token": _token,
+            },
             timeout=(5.0, 180.0),
         )
 
     try:
-        # 在锁保护下设置 JWT 并发送请求
-        async with token_mgr.env_lock:
-            os.environ["WARP_JWT"] = valid_token
-        resp = _post_once()
+        resp = _post_once(valid_token)
 
         if resp.status_code == 429:
             # 标记当前账号失败，尝试换号重试
@@ -325,9 +323,7 @@ async def chat_completions(req: ChatCompletionsRequest, request: Request = None)
             if retry_account and retry_account["id"] != account_id:
                 retry_token = await token_mgr.get_valid_token(retry_account)
                 if retry_token:
-                    async with token_mgr.env_lock:
-                        os.environ["WARP_JWT"] = retry_token
-                    resp = _post_once()
+                    resp = _post_once(retry_token)
                     account_id = retry_account["id"]
 
         if resp.status_code != 200:

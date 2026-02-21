@@ -20,12 +20,15 @@ from .packets import packet_template
 from .state import STATE, ensure_tool_ids
 
 
-def bridge_send_stream(packet: Dict[str, Any]) -> Dict[str, Any]:
+def bridge_send_stream(packet: Dict[str, Any], access_token: Optional[str] = None) -> Dict[str, Any]:
     last_exc: Optional[Exception] = None
     for base in FALLBACK_BRIDGE_URLS:
         url = f"{base}/api/warp/send_stream"
         try:
             wrapped_packet = {"json_data": packet, "message_type": "warp.multi_agent.v1.Request"}
+            # 如果 router 传入了 access_token，附加到请求中让 bridge 直接使用
+            if access_token:
+                wrapped_packet["access_token"] = access_token
             try:
                 logger.info("[OpenAI Compat] Bridge request URL: %s", url)
                 logger.info("[OpenAI Compat] Bridge request payload: %s", json.dumps(wrapped_packet, ensure_ascii=False))

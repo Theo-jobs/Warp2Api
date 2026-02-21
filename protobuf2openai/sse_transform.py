@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import Any, AsyncGenerator, Dict
+from typing import Any, AsyncGenerator, Dict, Optional
 
 import httpx
 from .logging import logger
@@ -11,7 +11,7 @@ from .config import BRIDGE_BASE_URL
 from .helpers import _get
 
 
-async def stream_openai_sse(packet: Dict[str, Any], completion_id: str, created_ts: int, model_id: str) -> AsyncGenerator[str, None]:
+async def stream_openai_sse(packet: Dict[str, Any], completion_id: str, created_ts: int, model_id: str, access_token: Optional[str] = None) -> AsyncGenerator[str, None]:
     try:
         first = {
             "id": completion_id,
@@ -41,11 +41,14 @@ async def stream_openai_sse(packet: Dict[str, Any], completion_id: str, created_
         timeout = httpx.Timeout(60.0)
         async with httpx.AsyncClient(http2=True, timeout=timeout, trust_env=True) as client:
             def _do_stream():
+                req_body = {"json_data": packet, "message_type": "warp.multi_agent.v1.Request"}
+                if access_token:
+                    req_body["access_token"] = access_token
                 return client.stream(
                     "POST",
                     f"{BRIDGE_BASE_URL}/api/warp/send_stream_sse",
                     headers={"accept": "text/event-stream"},
-                    json={"json_data": packet, "message_type": "warp.multi_agent.v1.Request"},
+                    json=req_body,
                 )
 
             # 首次请求

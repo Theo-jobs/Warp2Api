@@ -94,6 +94,9 @@ class EncodeRequest(BaseModel):
     mcp_context: Optional[Dict[str, Any]] = None
     existing_suggestions: Optional[Dict[str, Any]] = None
     client_version: Optional[str] = None
+
+    # Router 传入的 access_token，优先使用（跳过 _resolve_request_access_token）
+    access_token: Optional[str] = None
     os_category: Optional[str] = None
     os_name: Optional[str] = None
     os_version: Optional[str] = None
@@ -748,7 +751,14 @@ async def send_to_warp_api_parsed(request: EncodeRequest):
         max_retries = max(0, int(ACCOUNT_POOL_SWITCH_MAX_RETRIES))
         switch_attempt = 0
         session_id = str(uuid.uuid4())
-        access_token, using_pool = await _resolve_request_access_token(pool_client, session_id)
+
+        # 优先使用 router 传入的 access_token（多账号模式）
+        if request.access_token:
+            access_token = request.access_token
+            using_pool = False
+            logger.info("[Bridge] 使用 router 传入的 access_token")
+        else:
+            access_token, using_pool = await _resolve_request_access_token(pool_client, session_id)
 
         while True:
             try:
@@ -906,7 +916,13 @@ async def send_to_warp_api_stream_sse(request: EncodeRequest):
 
         async def _agen():
             session_id = str(uuid.uuid4())
-            access_token, using_pool = await _resolve_request_access_token(pool_client, session_id)
+            # 优先使用 router 传入的 access_token
+            if request.access_token:
+                access_token = request.access_token
+                using_pool = False
+                logger.info("[Bridge SSE] 使用 router 传入的 access_token")
+            else:
+                access_token, using_pool = await _resolve_request_access_token(pool_client, session_id)
             switch_attempt = 0
             event_no = 0
 

@@ -299,19 +299,9 @@ async def _on_startup():
     except Exception as e:
         logger.warning(f"[OpenAI Compat] Warmup initialize_once on startup failed: {e}")
 
-    # 启动时批量刷新所有账号 token
-    try:
-        token_mgr = TokenManager.get_instance(ACCOUNT_DB_PATH)
-        stats = await token_mgr.batch_refresh_all()
-        logger.info(
-            "[OpenAI Compat] 启动 Token 批量刷新完成: refreshed=%d failed=%d skipped=%d",
-            stats["refreshed"], stats["failed"], stats["skipped"],
-        )
-    except Exception as e:
-        logger.warning(f"[OpenAI Compat] 启动 Token 批量刷新失败: {e}")
-
-    # 启动后台定时刷新（每 50 分钟）
-    asyncio.create_task(_periodic_token_refresh())
+    # 批量 Token 刷新已改为手动触发（POST /api/tokens/refresh）
+    # 不再启动时自动刷新，避免 Firebase 限流
+    logger.info("[OpenAI Compat] Token 批量刷新已关闭自动启动，如需刷新请调用 POST /api/tokens/refresh")
 
 
 async def _periodic_token_refresh() -> None:

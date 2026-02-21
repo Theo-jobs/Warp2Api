@@ -142,6 +142,14 @@
             </div>
         </div>
 
+        <div class="card" style="margin-bottom: 20px;">
+            <div class="card-title">当前使用账号</div>
+            <div id="current-account" style="margin-top: 10px; font-size: 14px; color: #333;">
+                <div id="current-email" style="font-weight: 600; margin-bottom: 4px;">-</div>
+                <div id="current-info" style="color: #666; font-size: 12px;">-</div>
+            </div>
+        </div>
+
         <div class="controls">
             <input type="text" id="keyword" placeholder="搜索邮箱或 local_id">
             <select id="status">
@@ -155,6 +163,26 @@
         </div>
 
         <div id="loading" class="loading">加载中...</div>
+
+        <div style="margin-bottom: 30px;">
+            <h2 style="color: #333; margin-bottom: 15px; font-size: 18px;">最近使用记录</h2>
+            <table id="recent-table" style="display: none;">
+                <thead>
+                    <tr>
+                        <th>邮箱</th>
+                        <th>Local ID</th>
+                        <th>状态</th>
+                        <th>剩余额度</th>
+                        <th>使用次数</th>
+                        <th>最后使用</th>
+                    </tr>
+                </thead>
+                <tbody id="recent-body"></tbody>
+            </table>
+            <div id="recent-loading" class="loading" style="display: none;">加载最近使用记录...</div>
+        </div>
+
+        <h2 style="color: #333; margin-bottom: 15px; font-size: 18px;">所有账号</h2>
 
         <table id="accounts-table" style="display: none;">
             <thead>
@@ -182,14 +210,16 @@
 
         async function loadSummary() {
             try {
-                // 同时获取基础汇总和账号池状态
-                const [summaryResp, poolResp] = await Promise.all([
+                // 同时获取基础汇总、账号池状态和当前账号
+                const [summaryResp, poolResp, currentResp] = await Promise.all([
                     fetch('/api/accounts/summary'),
-                    fetch('/api/accounts/pool/status')
+                    fetch('/api/accounts/pool/status'),
+                    fetch('/api/accounts/current')
                 ]);
 
                 const summaryData = await summaryResp.json();
                 const poolData = await poolResp.json();
+                const currentData = await currentResp.json();
 
                 if (summaryData.success) {
                     const summary = summaryData.summary;
@@ -209,6 +239,16 @@
                     const pool = poolData.status;
                     document.getElementById('exhausted-count').textContent =
                         `额度耗尽: ${pool.exhausted}`;
+                }
+
+                if (currentData.success && currentData.account) {
+                    const acc = currentData.account;
+                    document.getElementById('current-email').textContent = acc.email;
+                    document.getElementById('current-info').textContent =
+                        `剩余额度: ${acc.remaining_limit} | 使用次数: ${acc.use_count || 0} | 最后使用: ${acc.last_used ? new Date(acc.last_used).toLocaleString('zh-CN') : '-'}`;
+                } else {
+                    document.getElementById('current-email').textContent = '无当前账号';
+                    document.getElementById('current-info').textContent = '尚未使用任何账号';
                 }
             } catch (error) {
                 showError('加载汇总数据失败: ' + error.message);
@@ -245,6 +285,43 @@
                 document.getElementById('loading').style.display = 'none';
                 showError('加载账号列表失败: ' + error.message);
             }
+        }
+
+        async function loadRecentUsed() {
+            document.getElementById('recent-loading').style.display = 'block';
+            document.getElementById('recent-table').style.display = 'none';
+
+            try {
+                const response = await fetch('/api/accounts?page_size=10&sort=last_used_desc');
+                const data = await response.json();
+
+                if (data.success && data.accounts) {
+                    renderRecentAccounts(data.accounts);
+                    document.getElementById('recent-table').style.display = 'table';
+                }
+                document.getElementById('recent-loading').style.display = 'none';
+            } catch (error) {
+                document.getElementById('recent-loading').style.display = 'none';
+                showError('加载最近使用记录失败: ' + error.message);
+            }
+        }
+
+        function renderRecentAccounts(accounts) {
+            const tbody = document.getElementById('recent-body');
+            tbody.innerHTML = '';
+
+            accounts.forEach(account => {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `
+                    <td>${account.email}</td>
+                    <td>${account.local_id.substring(0, 20)}...</td>
+                    <td><span class="status-badge status-${account.status}">${account.status}</span></td>
+                    <td>${account.remaining_limit}</td>
+                    <td>${account.use_count || 0}</td>
+                    <td>${account.last_used ? new Date(account.last_used).toLocaleString('zh-CN') : '-'}</td>
+                `;
+                tbody.appendChild(tr);
+            });
         }
 
         function renderAccounts(accounts) {
@@ -302,14 +379,18 @@
         // 初始加载
         loadSummary();
         loadAccounts();
+        loadRecentUsed();
 
         // 回车搜索
         document.getElementById('keyword').addEventListener('keypress', (e) => {
             if (e.key === 'Enter') loadAccounts();
         });
 
-        // 自动刷新汇总数据（每 30 秒）
-        setInterval(loadSummary, 30000);
+        // 自动刷新汇总数据和最近使用记录（每 30 秒）
+        setInterval(() => {
+            loadSummary();
+            loadRecentUsed();
+        }, 30000);
     </script>
 </body>
 </html>

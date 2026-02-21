@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import time
 import uuid
@@ -24,6 +25,8 @@ from .sse_transform import stream_openai_sse
 from .auth import authenticate_request
 
 from warp2protobuf.config.models import resolve_model, get_all_unique_models as _get_all_models
+from warp2protobuf.config.settings import ACCOUNT_DB_PATH
+from warp2protobuf.core.account_context import AccountContext, get_current_account_info
 
 router = APIRouter()
 
@@ -105,31 +108,55 @@ async def chat_completions(req: ChatCompletionsRequest, request: Request = None)
     if request:
         await authenticate_request(request)
 
+    # 使用账号上下文管理账号分配与使用追踪
     try:
-        initialize_once()
-    except Exception as e:
-        logger.warning(f"[OpenAI Compat] initialize_once failed or skipped: {e}")
+        with AccountContext(ACCOUNT_DB_PATH) as account_ctx:
+            # 临时设置当前账号的 JWT token
+            original_jwt = os.environ.get("WARP_JWT", "")
+            os.environ["WARP_JWT"] = account_ctx.get_id_token()
 
-    if not req.messages:
-        raise HTTPException(400, "messages 不能为空")
+            try:
+                initialize_once()
+            except Exception as e:
+                logger.warning(f"[OpenAI Compat] initialize_once failed or skipped: {e}")
 
-    # 1) 打印接收到的 Chat Completions 原始请求体
+            if not req.messages:
+                raise HTTPException(400, "messages 不能为空")
+
+            # 记录当前使用的账号
+            account_info = account_ctx.get_account_info()
+            logger.info(
+                "[OpenAI Compat] Using account: id=%d email=%s remaining=%d",
+                account_info["id"],
+                account_info["email"],
+                account_info["remaining_limit"],
+            )
+
+            # 1) 生产环境避免打印完整请求体，防止敏感信息泄露
+            try:
+                logger.info(
+                    "[OpenAI Compat] 接收到 Chat Completions 请求: model=%s stream=%s messages=%d tools=%d",
+                    req.model,
+                    req.stream,
+                    len(req.messages or []),
+                    len(req.tools or []),
+                )
+            except Exception:
+                logger.info("[OpenAI Compat] 接收到 Chat Completions 请求（摘要日志失败）")
+
+            # ... 继续原有逻辑 ...
+            # 整理消息
+            history: List[ChatMessage] = reorder_messages_for_anthropic(list(req.messages))
+
+    # 2) 仅记录整理后的摘要，避免日志落地完整上下文
     try:
-        logger.info("[OpenAI Compat] 接收到的 Chat Completions 请求体(原始): %s", json.dumps(req.dict(), ensure_ascii=False))
+        logger.info(
+            "[OpenAI Compat] post-reorder 摘要: messages=%d last_role=%s",
+            len(history),
+            history[-1].role if history else "none",
+        )
     except Exception:
-        logger.info("[OpenAI Compat] 接收到的 Chat Completions 请求体(原始) 序列化失败")
-
-    # 整理消息
-    history: List[ChatMessage] = reorder_messages_for_anthropic(list(req.messages))
-
-    # 2) 打印整理后的请求体（post-reorder）
-    try:
-        logger.info("[OpenAI Compat] 整理后的请求体(post-reorder): %s", json.dumps({
-            **req.dict(),
-            "messages": [m.dict() for m in history]
-        }, ensure_ascii=False))
-    except Exception:
-        logger.info("[OpenAI Compat] 整理后的请求体(post-reorder) 序列化失败")
+        logger.info("[OpenAI Compat] post-reorder 摘要日志失败")
 
     system_prompt_text: Optional[str] = None
     try:
@@ -178,11 +205,18 @@ async def chat_completions(req: ChatCompletionsRequest, request: Request = None)
         if mcp_tools:
             packet.setdefault("mcp_context", {}).setdefault("tools", []).extend(mcp_tools)
 
-    # 3) 打印转换成 protobuf JSON 的请求体（发送到 bridge 的数据包）
+    # 3) 仅记录发送包摘要，避免完整 payload 泄露
     try:
-        logger.info("[OpenAI Compat] 转换成 Protobuf JSON 的请求体: %s", json.dumps(packet, ensure_ascii=False))
+        input_count = len((((packet.get("input") or {}).get("user_inputs") or {}).get("inputs") or []))
+        image_count = len((((packet.get("input") or {}).get("context") or {}).get("images") or []))
+        logger.info(
+            "[OpenAI Compat] Protobuf JSON 摘要: input_count=%d image_count=%d has_mcp=%s",
+            input_count,
+            image_count,
+            bool((packet.get("mcp_context") or {}).get("tools")),
+        )
     except Exception:
-        logger.info("[OpenAI Compat] 转换成 Protobuf JSON 的请求体 序列化失败")
+        logger.info("[OpenAI Compat] Protobuf JSON 摘要日志失败")
 
     created_ts = int(time.time())
     completion_id = str(uuid.uuid4())
@@ -270,4 +304,27 @@ async def chat_completions(req: ChatCompletionsRequest, request: Request = None)
         "model": model_id,
         "choices": [{"index": 0, "message": msg_payload, "finish_reason": finish_reason}],
     }
-    return final 
+
+            # 提取 token 消耗并更新账号额度
+            try:
+                request_cost = bridge_resp.get("request_cost", 0)
+                if isinstance(request_cost, (int, float)) and request_cost > 0:
+                    tokens_used = int(request_cost)
+                    account_ctx.set_tokens_used(tokens_used)
+                    logger.info(
+                        "[OpenAI Compat] Request cost: %d tokens, account_id=%d",
+                        tokens_used,
+                        account_info["id"],
+                    )
+            except Exception as e:
+                logger.warning("[OpenAI Compat] Failed to extract token cost: %s", e)
+
+            # 恢复原 JWT
+            os.environ["WARP_JWT"] = original_jwt
+
+            return final
+    except Exception as e:
+        # 确保异常时也恢复 JWT
+        if 'original_jwt' in locals():
+            os.environ["WARP_JWT"] = original_jwt
+        raise 

@@ -156,6 +156,26 @@ async def record_account_usage(account_id: int, tokens: int = 0):
     }
 
 
+@app.get("/api/accounts/current")
+async def get_current_account():
+    """获取当前请求正在使用的账号信息（脱敏）"""
+    from warp2protobuf.core.account_context import get_current_account_info
+
+    account_info = get_current_account_info()
+
+    if not account_info:
+        return {
+            "success": False,
+            "message": "No account is currently in use",
+            "account": None,
+        }
+
+    return {
+        "success": True,
+        "account": account_info,
+    }
+
+
 @app.on_event("startup")
 async def _on_startup():
     try:

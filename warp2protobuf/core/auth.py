@@ -309,7 +309,7 @@ async def _create_anonymous_user() -> dict:
             "referralCode": None
         },
         "requestContext": {
-            "clientContext": {"id": CLIENT_ID, "version": CLIENT_VERSION},
+            "clientContext": {"version": CLIENT_VERSION},
             "osContext": {
                 "category": OS_CATEGORY,
                 "linuxKernelVersion": None,

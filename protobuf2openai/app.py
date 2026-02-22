@@ -349,7 +349,7 @@ async def verify_single_quota(account_id: int):
 
 class RegisterRequest(BaseModel):
     count: int = 5
-    delay_s: float = 2.0
+    delay_s: float = 5.0
     default_quota: int = 300
 
 

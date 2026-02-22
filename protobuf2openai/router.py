@@ -59,13 +59,12 @@ def _serialize_history_to_text(history: List[ChatMessage]) -> Optional[str]:
 
     # 计算尾部当前输入的范围（与 attach_user_and_tools_to_inputs 对齐）
     if non_system[-1].role == "tool":
-        # 尾部连续 tool_result 全部跳过
+        # 尾部连续 tool_result 全部跳过（它们作为结构化 tool_call_result 输入）
         split_idx = len(non_system)
         while split_idx > 0 and non_system[split_idx - 1].role == "tool":
             split_idx -= 1
-        # 对应的 assistant(tool_calls) 也跳过（它的 tool_call 已在结构化输入中）
-        if split_idx > 0 and non_system[split_idx - 1].role == "assistant":
-            split_idx -= 1
+        # 注意：保留 assistant(tool_calls) 在历史中！
+        # Warp 需要知道是哪个 assistant 调了什么工具
         history_msgs = non_system[:split_idx]
     else:
         # 最后一条 user 是当前输入
@@ -256,6 +255,14 @@ async def chat_completions(req: ChatCompletionsRequest, request: Request = None)
     logger.info("[OpenAI Compat] 模型映射: %s → %s", req.model, resolved)
 
     attach_user_and_tools_to_inputs(packet, history, system_prompt_text)
+
+    # 调试日志：记录 input 结构
+    inputs_list = packet.get("input", {}).get("user_inputs", {}).get("inputs", [])
+    input_types = [list(inp.keys())[0] if inp else "empty" for inp in inputs_list]
+    logger.info(
+        "[OpenAI Compat] Packet inputs: count=%d types=%s",
+        len(inputs_list), input_types,
+    )
 
     if req.tools:
         mcp_tools: List[Dict[str, Any]] = []

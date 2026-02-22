@@ -133,21 +133,56 @@ def attach_user_and_tools_to_inputs(packet: Dict[str, Any], history: List[ChatMe
         packet["input"]["user_inputs"]["inputs"].append({"user_query": user_query_payload})
         return
     if last.role == "tool":
-        # 收集尾部所有连续的 tool_result（Claude Code 可能一次调多个工具）
+        # 无状态模式：Warp 不记得上一轮的 tool_call_id，
+        # 结构化 tool_call_result 会被忽略。
+        # 改为：把所有 tool_result 序列化成文本，作为普通 user_query 发送。
         tool_start = len(history)
         while tool_start > 0 and history[tool_start - 1].role == "tool":
             tool_start -= 1
         tool_results = history[tool_start:]
+
+        # 同时找到对应的 assistant tool_call 消息（紧挨 tool_results 前面）
+        tool_call_text_parts: List[str] = []
+        if tool_start > 0 and history[tool_start - 1].role == "assistant":
+            assistant_msg = history[tool_start - 1]
+            content_list = normalize_content_to_list(assistant_msg.content)
+            for seg in content_list:
+                if isinstance(seg, dict):
+                    if seg.get("type") == "tool_use":
+                        name = seg.get("name", "unknown_tool")
+                        args = json.dumps(seg.get("input", {}), ensure_ascii=False)
+                        tool_call_text_parts.append(f"[Tool Call] {name}({args})")
+                    elif seg.get("type") == "text" and seg.get("text", "").strip():
+                        tool_call_text_parts.append(seg["text"])
+
+        # 序列化 tool_results
+        result_text_parts: List[str] = []
         for tr in tool_results:
-            if tr.tool_call_id:
-                packet["input"]["user_inputs"]["inputs"].append({
-                    "tool_call_result": {
-                        "tool_call_id": tr.tool_call_id,
-                        "call_mcp_tool": {
-                            "success": {"results": segments_to_warp_results(normalize_content_to_list(tr.content))}
-                        },
+            tool_name = tr.name or "tool"
+            content_text = segments_to_text(normalize_content_to_list(tr.content))
+            result_text_parts.append(f"[Tool Result: {tool_name}] (call_id={tr.tool_call_id})\n{content_text}")
+
+        # 组合成完整文本
+        combined = ""
+        if tool_call_text_parts:
+            combined += "Assistant called the following tools:\n" + "\n".join(tool_call_text_parts) + "\n\n"
+        combined += "Tool execution results:\n" + "\n---\n".join(result_text_parts)
+        combined += "\n\nPlease continue based on the tool results above."
+
+        user_query_payload: Dict[str, Any] = {"query": combined}
+        if system_prompt_text:
+            user_query_payload["referenced_attachments"] = {
+                "SYSTEM_PROMPT": {
+                    "plain_text": f"""<ALERT>you are not allowed to call following tools:  - `read_files`
+- `write_files`
+- `run_commands`
+- `list_files`
+- `str_replace_editor`
+- `ask_followup_question`
+- `attempt_completion`</ALERT>{system_prompt_text}"""
                     }
-                })
+                }
+        packet["input"]["user_inputs"]["inputs"].append({"user_query": user_query_payload})
         return
     # If neither, raise to catch protocol violations
     raise ValueError("post-reorder 最后一条必须是 user 或 tool 结果") 

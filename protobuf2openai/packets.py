@@ -145,15 +145,20 @@ def attach_user_and_tools_to_inputs(packet: Dict[str, Any], history: List[ChatMe
         tool_call_text_parts: List[str] = []
         if tool_start > 0 and history[tool_start - 1].role == "assistant":
             assistant_msg = history[tool_start - 1]
+            # OpenAI 格式：tool_calls 在 assistant_msg.tool_calls 字段
+            if assistant_msg.tool_calls:
+                for tc in assistant_msg.tool_calls:
+                    fn = tc.get("function", {})
+                    name = fn.get("name", "unknown_tool")
+                    args = fn.get("arguments", "{}")
+                    tool_call_text_parts.append(f"[Tool Call] {name}({args})")
+            # 也检查 content 里的文本（assistant 可能有思考过程）
             content_list = normalize_content_to_list(assistant_msg.content)
             for seg in content_list:
-                if isinstance(seg, dict):
-                    if seg.get("type") == "tool_use":
-                        name = seg.get("name", "unknown_tool")
-                        args = json.dumps(seg.get("input", {}), ensure_ascii=False)
-                        tool_call_text_parts.append(f"[Tool Call] {name}({args})")
-                    elif seg.get("type") == "text" and seg.get("text", "").strip():
-                        tool_call_text_parts.append(seg["text"])
+                if isinstance(seg, dict) and seg.get("type") == "text" and seg.get("text", "").strip():
+                    tool_call_text_parts.append(seg["text"])
+                elif isinstance(seg, str) and seg.strip():
+                    tool_call_text_parts.append(seg)
 
         # 序列化 tool_results
         result_text_parts: List[str] = []

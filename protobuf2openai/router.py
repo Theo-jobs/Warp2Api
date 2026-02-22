@@ -240,7 +240,7 @@ async def chat_completions(req: ChatCompletionsRequest, request: Request = None)
 
     # 调试：记录 Claude Code 发来的 tools 名称
     if req.tools:
-        tool_names = [t.get("function", {}).get("name", "?") if isinstance(t, dict) else "?" for t in req.tools[:10]]
+        tool_names = [t.function.name for t in req.tools[:10]]
         logger.info("[OpenAI Compat] Client tools (first 10): %s", tool_names)
 
     # 多轮对话：将历史序列化为文本注入 system prompt（T4 方案）

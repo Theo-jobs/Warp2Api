@@ -238,6 +238,11 @@ async def chat_completions(req: ChatCompletionsRequest, request: Request = None)
     task_id = str(uuid.uuid4())
     packet = packet_template()
 
+    # 调试：记录 Claude Code 发来的 tools 名称
+    if req.tools:
+        tool_names = [t.get("function", {}).get("name", "?") if isinstance(t, dict) else "?" for t in req.tools[:10]]
+        logger.info("[OpenAI Compat] Client tools (first 10): %s", tool_names)
+
     # 多轮对话：将历史序列化为文本注入 system prompt（T4 方案）
     # 每次都当新会话处理，空 task_context，完全无状态
     history_text = _serialize_history_to_text(history)

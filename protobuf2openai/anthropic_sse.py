@@ -1,0 +1,461 @@
+"""
+Anthropic Messages SSE 流式输出
+================================
+将 Warp bridge 的 protobuf SSE 流转换为 Anthropic Messages API 的 SSE 格式。
+
+参照 sse_transform.py 中 stream_openai_sse() 的 bridge 请求 + protobuf 解析模式，
+输出符合 Anthropic Messages Streaming 规范的 SSE 事件。
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+import uuid
+from dataclasses import dataclass, field
+from typing import AsyncGenerator
+
+import httpx
+
+from .config import BRIDGE_BASE_URL
+from .helpers import _get
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# 工具函数
+# ---------------------------------------------------------------------------
+
+def _sse_line(event: str, data: dict | str) -> str:
+    """构造一行 SSE 输出。"""
+    payload = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)
+    return f"event: {event}\ndata: {payload}\n\n"
+
+
+def _gen_msg_id() -> str:
+    return f"msg_{uuid.uuid4().hex[:24]}"
+
+
+def _gen_tool_use_id() -> str:
+    return f"toolu_{uuid.uuid4().hex[:24]}"
+
+
+# ---------------------------------------------------------------------------
+# 状态跟踪
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AnthropicSseState:
+    """跟踪 Anthropic SSE 流的状态。"""
+    model: str = "claude-sonnet-4-20250514"
+    message_id: str = ""
+    block_index: int = 0
+    block_type: str = ""          # "text" | "tool_use" | ""
+    current_tool_id: str = ""
+    current_tool_name: str = ""
+    input_json_buf: str = ""      # tool_use 的 input JSON 累积
+    started: bool = False
+    has_tool_use: bool = False     # 是否曾经发射过 tool_use block
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+    def next_block_index(self) -> int:
+        idx = self.block_index
+        self.block_index += 1
+        return idx
+
+
+# ---------------------------------------------------------------------------
+# Anthropic SSE 事件发射
+# ---------------------------------------------------------------------------
+
+def _emit_message_start(state: AnthropicSseState) -> str:
+    state.message_id = _gen_msg_id()
+    state.started = True
+    return _sse_line("message_start", {
+        "type": "message_start",
+        "message": {
+            "id": state.message_id,
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": state.model,
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens": state.input_tokens,
+                "output_tokens": 0,
+            },
+        },
+    })
+
+
+def _emit_ping() -> str:
+    return _sse_line("ping", {"type": "ping"})
+
+
+def _open_text_block(state: AnthropicSseState) -> str:
+    idx = state.next_block_index()
+    state.block_type = "text"
+    return _sse_line("content_block_start", {
+        "type": "content_block_start",
+        "index": idx,
+        "content_block": {"type": "text", "text": ""},
+    })
+
+
+def _emit_text_delta(state: AnthropicSseState, text: str) -> str:
+    return _sse_line("content_block_delta", {
+        "type": "content_block_delta",
+        "index": state.block_index - 1,
+        "delta": {"type": "text_delta", "text": text},
+    })
+
+
+def _close_text_block(state: AnthropicSseState) -> str:
+    state.block_type = ""
+    return _sse_line("content_block_stop", {
+        "type": "content_block_stop",
+        "index": state.block_index - 1,
+    })
+
+
+def _open_tool_use_block(state: AnthropicSseState, tool_id: str, name: str) -> str:
+    idx = state.next_block_index()
+    state.block_type = "tool_use"
+    state.current_tool_id = tool_id
+    state.current_tool_name = name
+    state.input_json_buf = ""
+    state.has_tool_use = True
+    return _sse_line("content_block_start", {
+        "type": "content_block_start",
+        "index": idx,
+        "content_block": {"type": "tool_use", "id": tool_id, "name": name, "input": {}},
+    })
+
+
+def _emit_tool_input_delta(state: AnthropicSseState, partial_json: str) -> str:
+    return _sse_line("content_block_delta", {
+        "type": "content_block_delta",
+        "index": state.block_index - 1,
+        "delta": {"type": "input_json_delta", "partial_json": partial_json},
+    })
+
+
+def _close_tool_use_block(state: AnthropicSseState) -> str:
+    state.block_type = ""
+    state.current_tool_id = ""
+    state.current_tool_name = ""
+    state.input_json_buf = ""
+    return _sse_line("content_block_stop", {
+        "type": "content_block_stop",
+        "index": state.block_index - 1,
+    })
+
+
+def _emit_message_delta(state: AnthropicSseState, stop_reason: str = "end_turn") -> str:
+    return _sse_line("message_delta", {
+        "type": "message_delta",
+        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+        "usage": {"output_tokens": state.output_tokens},
+    })
+
+
+def _emit_message_stop() -> str:
+    return _sse_line("message_stop", {"type": "message_stop"})
+
+
+# ---------------------------------------------------------------------------
+# 流结束处理
+# ---------------------------------------------------------------------------
+
+def _finalize(state: AnthropicSseState) -> list[str]:
+    """流结束时，关闭所有未关闭的 block 并发送结束事件。"""
+    parts: list[str] = []
+    if state.block_type == "text":
+        parts.append(_close_text_block(state))
+    elif state.block_type == "tool_use":
+        parts.append(_close_tool_use_block(state))
+
+    stop_reason = "tool_use" if state.has_tool_use else "end_turn"
+    # 简单判断：如果 block_index > 1 或者有 tool block 被关闭过
+    parts.append(_emit_message_delta(state, stop_reason))
+    parts.append(_emit_message_stop())
+    return parts
+
+
+# ---------------------------------------------------------------------------
+# Protobuf 事件处理（参照 sse_transform.py 的解析逻辑）
+# ---------------------------------------------------------------------------
+
+def _process_warp_event(ev: dict, state: AnthropicSseState) -> list[str]:
+    """
+    解析一个 Warp bridge SSE event（protobuf 格式），
+    提取文本和 tool_call，转换为 Anthropic SSE 事件。
+
+    与 sse_transform.py 的解析结构完全对齐：
+    - client_actions 是 dict（不是 list）
+    - 支持 snake_case / camelCase 双写
+    - 文本路径: append_to_message_content.message.agent_output.text
+    - 工具路径: add_messages_to_task.messages[].tool_call.call_mcp_tool
+    """
+    parts: list[str] = []
+
+    parsed = ev.get("parsed_data")
+    if not parsed:
+        return parts
+
+    # client_actions 是 dict，不是 list
+    client_actions = _get(parsed, "client_actions", "clientActions")
+    if not isinstance(client_actions, dict):
+        return parts
+
+    actions = _get(client_actions, "actions", "Actions") or []
+    for action in actions:
+        # ---- 文本内容 ----
+        append_data = _get(action, "append_to_message_content", "appendToMessageContent")
+        if isinstance(append_data, dict):
+            message = append_data.get("message", {})
+            agent_output = _get(message, "agent_output", "agentOutput") or {}
+            text_content = agent_output.get("text", "")
+            if text_content:
+                # 如果当前有 tool_use block 打开，先关闭
+                if state.block_type == "tool_use":
+                    parts.append(_close_tool_use_block(state))
+                # 如果没有 text block 打开，先打开
+                if state.block_type != "text":
+                    parts.append(_open_text_block(state))
+                parts.append(_emit_text_delta(state, text_content))
+                state.output_tokens += max(1, len(text_content) // 4)
+
+        # ---- Tool call ----
+        messages_data = _get(action, "add_messages_to_task", "addMessagesToTask")
+        if isinstance(messages_data, dict):
+            messages = messages_data.get("messages", [])
+            for msg in messages:
+                # 优先检查 tool_call.call_mcp_tool（Warp protobuf 格式）
+                tool_call = _get(msg, "tool_call", "toolCall") or {}
+                call_mcp = _get(tool_call, "call_mcp_tool", "callMcpTool") or {}
+                if isinstance(call_mcp, dict) and call_mcp.get("name"):
+                    name = call_mcp["name"]
+                    try:
+                        args_obj = call_mcp.get("args", {}) or {}
+                        args_str = json.dumps(args_obj, ensure_ascii=False)
+                    except Exception:
+                        args_str = "{}"
+                    tool_call_id = tool_call.get("tool_call_id") or _gen_tool_use_id()
+
+                    # 关闭当前打开的 block
+                    if state.block_type == "text":
+                        parts.append(_close_text_block(state))
+                    elif state.block_type == "tool_use":
+                        parts.append(_close_tool_use_block(state))
+
+                    # 打开新的 tool_use block
+                    anthropic_tool_id = _gen_tool_use_id()
+                    parts.append(_open_tool_use_block(state, anthropic_tool_id, name))
+
+                    # 发射 input_json_delta
+                    if args_str and args_str != "{}":
+                        parts.append(_emit_tool_input_delta(state, args_str))
+                        state.input_json_buf = args_str
+
+                    # 立即关闭 tool_use block（bridge 一次性给出完整 arguments）
+                    parts.append(_close_tool_use_block(state))
+
+                    state.output_tokens += max(1, len(args_str) // 4)
+                else:
+                    # 非 tool_call 消息，可能包含 agent_output 文本
+                    agent_output = _get(msg, "agent_output", "agentOutput") or {}
+                    text_content = agent_output.get("text", "")
+                    if text_content:
+                        if state.block_type == "tool_use":
+                            parts.append(_close_tool_use_block(state))
+                        if state.block_type != "text":
+                            parts.append(_open_text_block(state))
+                        parts.append(_emit_text_delta(state, text_content))
+                        state.output_tokens += max(1, len(text_content) // 4)
+
+    return parts
+
+
+# ---------------------------------------------------------------------------
+# 主函数：stream_anthropic_sse
+# ---------------------------------------------------------------------------
+
+async def stream_anthropic_sse(
+    packet: dict,
+    *,
+    model: str = "claude-sonnet-4-20250514",
+    access_token: str | None = None,
+) -> AsyncGenerator[str, None]:
+    """
+    向 Warp bridge 发送请求，将 protobuf SSE 流转换为 Anthropic Messages SSE 格式。
+
+    参照 sse_transform.py 中 stream_openai_sse() 的 bridge 请求模式。
+    """
+    state = AnthropicSseState(model=model)
+
+    # ---- 构造 bridge 请求（与 stream_openai_sse 完全一致：JSON body） ----
+    bridge_url = f"{BRIDGE_BASE_URL}/api/warp/send_stream_sse"
+    req_body: dict = {
+        "json_data": packet,
+        "message_type": "warp.multi_agent.v1.Request",
+    }
+    if access_token:
+        req_body["access_token"] = access_token
+
+    logger.info("[anthropic_sse] bridge_url=%s model=%s", bridge_url, model)
+
+    try:
+        async with httpx.AsyncClient(
+            http2=True,
+            timeout=httpx.Timeout(300.0, connect=30.0),
+            trust_env=True,
+        ) as client:
+            async with client.stream(
+                "POST", bridge_url,
+                headers={"accept": "text/event-stream"},
+                json=req_body,
+            ) as resp:
+                if resp.status_code != 200:
+                    body = await resp.aread()
+                    logger.error(
+                        "[anthropic_sse] bridge returned %s: %s",
+                        resp.status_code,
+                        body[:500],
+                    )
+                    error_msg = f"Bridge error: HTTP {resp.status_code}"
+                    yield _emit_message_start(state)
+                    yield _open_text_block(state)
+                    yield _emit_text_delta(state, error_msg)
+                    yield _close_text_block(state)
+                    yield _emit_message_delta(state, "end_turn")
+                    yield _emit_message_stop()
+                    return
+
+                # ---- 发射 message_start + ping ----
+                yield _emit_message_start(state)
+                yield _emit_ping()
+
+                # ---- SSE 流解析（与 stream_openai_sse 一致：aiter_lines） ----
+                current = ""
+                _event_count = 0
+                async for line in resp.aiter_lines():
+                    if line.startswith("data:"):
+                        payload_str = line[5:].strip()
+                        if not payload_str:
+                            continue
+                        logger.info("[anthropic_sse] 接收到 Protobuf SSE 数据块（len=%d）", len(payload_str))
+                        if payload_str == "[DONE]":
+                            break
+                        current += payload_str
+                        continue
+                    if (line.strip() == "") and current:
+                        try:
+                            ev = json.loads(current)
+                        except json.JSONDecodeError:
+                            logger.warning(
+                                "[anthropic_sse] JSON decode error: %s",
+                                current[:200],
+                            )
+                            current = ""
+                            continue
+                        current = ""
+                        _event_count += 1
+
+                        # 记录事件摘要
+                        event_data = (ev or {}).get("parsed_data") or {}
+                        try:
+                            logger.info(
+                                "[anthropic_sse] 接收到 Protobuf 事件 #%d (parsed): keys=%s",
+                                _event_count,
+                                list(event_data.keys()) if isinstance(event_data, dict) else type(event_data).__name__,
+                            )
+                        except Exception:
+                            pass
+
+                        # 检查错误事件
+                        if isinstance(ev, dict) and ev.get("error"):
+                            err_msg = str(ev["error"])
+                            logger.error("[anthropic_sse] Bridge SSE error: %s", err_msg)
+                            if state.block_type != "text":
+                                yield _open_text_block(state)
+                            yield _emit_text_delta(state, f"Bridge error: {err_msg}")
+                            continue
+
+                        # 处理 protobuf 事件
+                        parts = _process_warp_event(ev, state)
+                        for p in parts:
+                            # 记录发射的 SSE 事件类型
+                            try:
+                                _evt_type = ""
+                                if "content_block_delta" in p:
+                                    _pdata = json.loads(p.split("data: ", 1)[1].split("\n")[0])
+                                    _delta = _pdata.get("delta", {})
+                                    if _delta.get("type") == "text_delta":
+                                        logger.info("[anthropic_sse] emit: text_delta len=%d", len(_delta.get("text", "")))
+                                    elif _delta.get("type") == "input_json_delta":
+                                        logger.info("[anthropic_sse] emit: input_json_delta len=%d", len(_delta.get("partial_json", "")))
+                                elif "content_block_start" in p:
+                                    _pdata = json.loads(p.split("data: ", 1)[1].split("\n")[0])
+                                    _block = _pdata.get("content_block", {})
+                                    logger.info("[anthropic_sse] emit: block_start type=%s", _block.get("type", "?"))
+                                elif "content_block_stop" in p:
+                                    logger.info("[anthropic_sse] emit: block_stop index=%d", state.block_index - 1)
+                            except Exception:
+                                pass
+                            yield p
+
+                        # 检查 finished 事件
+                        if "finished" in event_data:
+                            logger.info("[anthropic_sse] 收到 finished 事件，结束流")
+                            break
+
+                # ---- 流结束，finalize ----
+                logger.info(
+                    "[anthropic_sse] 流结束: events=%d blocks=%d has_tool_use=%s output_tokens=%d",
+                    _event_count, state.block_index, state.has_tool_use, state.output_tokens,
+                )
+                for p in _finalize(state):
+                    yield p
+
+    except httpx.ConnectError as exc:
+        logger.error("[anthropic_sse] connect error: %s", exc)
+        state_fresh = AnthropicSseState(model=model)
+        yield _emit_message_start(state_fresh)
+        yield _open_text_block(state_fresh)
+        yield _emit_text_delta(state_fresh, f"Connection error: {exc}")
+        yield _close_text_block(state_fresh)
+        yield _emit_message_delta(state_fresh, "end_turn")
+        yield _emit_message_stop()
+
+    except httpx.ReadTimeout as exc:
+        logger.error("[anthropic_sse] read timeout: %s", exc)
+        # 如果已经开始了，尝试 finalize
+        if state.started:
+            for p in _finalize(state):
+                yield p
+        else:
+            state_fresh = AnthropicSseState(model=model)
+            yield _emit_message_start(state_fresh)
+            yield _open_text_block(state_fresh)
+            yield _emit_text_delta(state_fresh, "Request timed out")
+            yield _close_text_block(state_fresh)
+            yield _emit_message_delta(state_fresh, "end_turn")
+            yield _emit_message_stop()
+
+    except Exception as exc:
+        logger.exception("[anthropic_sse] unexpected error")
+        if state.started:
+            for p in _finalize(state):
+                yield p
+        else:
+            state_fresh = AnthropicSseState(model=model)
+            yield _emit_message_start(state_fresh)
+            yield _open_text_block(state_fresh)
+            yield _emit_text_delta(state_fresh, f"Internal error: {exc}")
+            yield _close_text_block(state_fresh)
+            yield _emit_message_delta(state_fresh, "end_turn")
+            yield _emit_message_stop()

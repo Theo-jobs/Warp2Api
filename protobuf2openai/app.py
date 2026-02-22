@@ -18,6 +18,7 @@ from .logging import logger
 from .config import BRIDGE_BASE_URL, WARMUP_INIT_RETRIES, WARMUP_INIT_DELAY_S
 from .bridge import initialize_once
 from .router import router
+from .anthropic_router import anthropic_router
 from .token_manager import TokenManager
 from .auth import verify_admin_token
 
@@ -32,6 +33,7 @@ _START_TIME = time.time()
 
 app = FastAPI(title="OpenAI Chat Completions (Warp bridge) - Streaming")
 app.include_router(router)
+app.include_router(anthropic_router)
 
 # 挂载静态文件（GUI）
 SCRIPT_DIR = Path(__file__).parent.parent

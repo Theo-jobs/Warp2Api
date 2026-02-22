@@ -72,14 +72,24 @@ async def authenticate_request(request: Request) -> None:
     """
     FastAPI中间件函数 - 验证请求的认证
 
+    支持两种认证方式:
+      - OpenAI:    Authorization: Bearer xxx
+      - Anthropic: x-api-key: xxx
+
     Args:
         request: FastAPI请求对象
 
     Raises:
         HTTPException: 认证失败时抛出
     """
-    # 获取Authorization头
+    # 优先检查 Authorization: Bearer xxx (OpenAI 格式)
     authorization = request.headers.get("authorization") or request.headers.get("Authorization")
+
+    if not authorization:
+        # 回退到 x-api-key (Anthropic 格式)
+        api_key = request.headers.get("x-api-key")
+        if api_key:
+            authorization = f"Bearer {api_key}"
 
     # 验证token
     if not auth.authenticate(authorization):

@@ -6,7 +6,7 @@
 set -euo pipefail
 
 # ---------- 配置区（按需修改） ----------
-SSH_HOST="192.168.50.200"
+SSH_HOST="100.66.1.1"
 SSH_PORT="10000"
 SSH_USER="18668588631"
 SSH_PASS="cz.950427"

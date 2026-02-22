@@ -109,6 +109,16 @@
 
         .loading { text-align: center; padding: 40px; color: #666; }
         .error { background: #f8d7da; color: #721c24; padding: 15px; border-radius: 4px; margin-bottom: 20px; }
+        .success-msg { background: #d4edda; color: #155724; padding: 15px; border-radius: 4px; margin-bottom: 20px; }
+        .btn-warning { background: #ffc107; color: #333; }
+        .btn-warning:hover { background: #e0a800; }
+        .btn-danger { background: #dc3545; }
+        .btn-danger:hover { background: #c82333; }
+        .btn-sm { padding: 4px 10px; font-size: 12px; }
+        .verify-progress { background: white; padding: 15px; border-radius: 8px; margin-bottom: 20px; display: none; }
+        .verify-progress .bar { height: 8px; background: #e9ecef; border-radius: 4px; overflow: hidden; margin: 10px 0; }
+        .verify-progress .bar-fill { height: 100%; background: #28a745; transition: width 0.3s; }
+        .verify-result { font-size: 13px; color: #666; margin-top: 8px; }
     </style>
 </head>
 <body>
@@ -149,8 +159,6 @@
                 <div id="current-info" style="color: #666; font-size: 12px;">-</div>
             </div>
         </div>
-            </div>
-        </div>
 
         <div class="controls">
             <input type="text" id="keyword" placeholder="搜索邮箱或 local_id">
@@ -162,6 +170,16 @@
             </select>
             <button onclick="loadAccounts()">🔍 搜索</button>
             <button onclick="loadSummary()">🔄 刷新</button>
+            <button onclick="batchVerifyQuota()" class="btn-warning" id="btn-verify">🔍 检查全部额度</button>
+        </div>
+
+        <div class="verify-progress" id="verify-progress">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <span id="verify-status">正在检查额度...</span>
+                <span id="verify-count">0/0</span>
+            </div>
+            <div class="bar"><div class="bar-fill" id="verify-bar" style="width: 0%"></div></div>
+            <div class="verify-result" id="verify-result"></div>
         </div>
 
         <div id="loading" class="loading">加载中...</div>
@@ -198,6 +216,7 @@
                     <th>剩余</th>
                     <th>使用次数</th>
                     <th>最后检查</th>
+                    <th>操作</th>
                 </tr>
             </thead>
             <tbody id="accounts-body"></tbody>
@@ -315,6 +334,12 @@
                 const response = await authFetch(`/api/accounts?${params}`);
                 const data = await response.json();
 
+                if (!data.success || !data.accounts) {
+                    showError('加载账号列表失败: ' + (data.detail || '未知错误'));
+                    document.getElementById('loading').style.display = 'none';
+                    return;
+                }
+
                 renderAccounts(data.accounts);
                 renderPagination(data.page, data.total_pages);
 
@@ -332,7 +357,7 @@
             document.getElementById('recent-table').style.display = 'none';
 
             try {
-                const response = await authFetch('/api/accounts?page_size=10&sort=last_used_desc');
+                const response = await authFetch('/api/accounts/recent');
                 const data = await response.json();
 
                 if (data.success && data.accounts) {
@@ -370,6 +395,7 @@
 
             accounts.forEach(account => {
                 const tr = document.createElement('tr');
+                tr.id = `account-row-${account.id}`;
                 tr.innerHTML = `
                     <td>${account.id}</td>
                     <td>${account.email}</td>
@@ -380,6 +406,7 @@
                     <td>${account.remaining_limit}</td>
                     <td>${account.use_count || 0}</td>
                     <td>${account.last_check ? new Date(account.last_check).toLocaleString('zh-CN') : '-'}</td>
+                    <td><button class="btn-sm btn-warning" onclick="verifySingle(${account.id}, this)">检查</button></td>
                 `;
                 tbody.appendChild(tr);
             });
@@ -414,6 +441,76 @@
             setTimeout(() => {
                 errorDiv.style.display = 'none';
             }, 5000);
+        }
+
+        // 单个账号额度检查
+        async function verifySingle(accountId, btn) {
+            const origText = btn.textContent;
+            btn.textContent = '检查中...';
+            btn.disabled = true;
+            try {
+                const resp = await authFetch(`/api/accounts/${accountId}/verify-quota`, { method: 'POST' });
+                const data = await resp.json();
+                if (data.success && data.result) {
+                    const r = data.result;
+                    if (r.valid) {
+                        btn.textContent = '✅ 有效';
+                        btn.style.background = '#28a745';
+                        btn.style.color = 'white';
+                    } else {
+                        btn.textContent = '❌ 失效';
+                        btn.style.background = '#dc3545';
+                        btn.style.color = 'white';
+                    }
+                }
+            } catch (e) {
+                btn.textContent = '❌ 错误';
+                showError('检查失败: ' + e.message);
+            }
+            setTimeout(() => {
+                btn.textContent = origText;
+                btn.disabled = false;
+                btn.style.background = '';
+                btn.style.color = '';
+                loadAccounts(currentPage);
+            }, 2000);
+        }
+
+        // 批量额度检查
+        async function batchVerifyQuota() {
+            const btn = document.getElementById('btn-verify');
+            const progress = document.getElementById('verify-progress');
+            btn.disabled = true;
+            btn.textContent = '检查中...';
+            progress.style.display = 'block';
+            document.getElementById('verify-bar').style.width = '0%';
+            document.getElementById('verify-status').textContent = '正在批量检查所有账号额度...';
+            document.getElementById('verify-count').textContent = '';
+            document.getElementById('verify-result').textContent = '';
+
+            try {
+                const resp = await authFetch('/api/accounts/verify-quota', { method: 'POST' });
+                const data = await resp.json();
+                if (data.success && data.results) {
+                    const r = data.results;
+                    document.getElementById('verify-bar').style.width = '100%';
+                    document.getElementById('verify-status').textContent = '检查完成！';
+                    document.getElementById('verify-count').textContent = `${r.total}/${r.total}`;
+                    document.getElementById('verify-result').textContent =
+                        `✅ 有效: ${r.valid}  |  ❌ 失效: ${r.invalid}`;
+                    // 刷新数据
+                    loadSummary();
+                    loadAccounts(currentPage);
+                    loadRecentUsed();
+                }
+            } catch (e) {
+                document.getElementById('verify-status').textContent = '检查失败';
+                document.getElementById('verify-result').textContent = e.message;
+                showError('批量检查失败: ' + e.message);
+            }
+            btn.disabled = false;
+            btn.textContent = '🔍 检查全部额度';
+            setTimeout(() => { progress.style.display = 'none'; }, 5000);
         }
 
         // 初始加载

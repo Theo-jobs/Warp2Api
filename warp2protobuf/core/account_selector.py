@@ -124,7 +124,7 @@ class AccountSelector:
 
             cursor.execute("""
                 SELECT
-                    id, email, local_id, use_count, last_used,
+                    id, email, local_id, status, use_count, last_used,
                     total_limit, used_limit,
                     (total_limit - used_limit) as remaining_limit
                 FROM accounts

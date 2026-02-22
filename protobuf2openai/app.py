@@ -79,6 +79,7 @@ async def list_accounts(
         "total": total,
         "page": page,
         "page_size": page_size,
+        "total_pages": (total + page_size - 1) // page_size,
     }
 
 
@@ -170,6 +171,22 @@ async def get_current_account():
     }
 
 
+@app.get("/api/accounts/recent", dependencies=[Depends(verify_admin_token)])
+async def get_recent_accounts():
+    """获取最近使用的账号列表"""
+    if not ACCOUNT_ADMIN_ENABLED:
+        raise HTTPException(status_code=403, detail="Account management is disabled")
+
+    selector = AccountSelector(ACCOUNT_DB_PATH)
+    recent = selector.get_recently_used_accounts(limit=10)
+
+    return {
+        "success": True,
+        "accounts": recent,
+        "total": len(recent),
+    }
+
+
 @app.get("/api/accounts/{account_id}", dependencies=[Depends(verify_admin_token)])
 async def get_account_detail(account_id: int):
     """获取单个账号详情"""
@@ -188,20 +205,146 @@ async def get_account_detail(account_id: int):
     }
 
 
-@app.get("/api/accounts/recent", dependencies=[Depends(verify_admin_token)])
-async def get_recent_accounts():
-    """获取最近使用的账号列表"""
+@app.post("/api/accounts/verify-quota", dependencies=[Depends(verify_admin_token)])
+async def batch_verify_quota():
+    """批量验证所有账号的真实额度（通过 token refresh 检测）"""
     if not ACCOUNT_ADMIN_ENABLED:
         raise HTTPException(status_code=403, detail="Account management is disabled")
 
-    selector = AccountSelector(ACCOUNT_DB_PATH)
-    recent = selector.get_recently_used_accounts(limit=10)
+    from warp2protobuf.core.auth import refresh_access_token_with_refresh_token
 
-    return {
-        "success": True,
-        "accounts": recent,
-        "total": len(recent),
-    }
+    store = AccountStore(ACCOUNT_DB_PATH)
+    accounts, total = store.get_accounts(page=1, page_size=500)
+
+    results = {"total": total, "valid": 0, "invalid": 0, "details": []}
+
+    for account in accounts:
+        account_id = account["id"]
+        email = account["email"]
+
+        # 需要完整 token，从数据库直接查
+        import sqlite3
+        with sqlite3.connect(str(store.db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT refresh_token FROM accounts WHERE id = ?",
+                (account_id,),
+            )
+            row = cursor.fetchone()
+
+        if not row or not row["refresh_token"]:
+            results["invalid"] += 1
+            results["details"].append({
+                "id": account_id, "email": email,
+                "valid": False, "error": "missing refresh_token",
+            })
+            continue
+
+        try:
+            await refresh_access_token_with_refresh_token(row["refresh_token"])
+            results["valid"] += 1
+            # 更新 last_check
+            from datetime import datetime
+            now = datetime.now().isoformat()
+            with sqlite3.connect(str(store.db_path)) as conn:
+                conn.execute(
+                    "UPDATE accounts SET last_check = ?, updated_at = ? WHERE id = ?",
+                    (now, now, account_id),
+                )
+                conn.commit()
+            results["details"].append({
+                "id": account_id, "email": email, "valid": True, "error": None,
+            })
+        except Exception as e:
+            error_msg = str(e)[:200]
+            results["invalid"] += 1
+            # 标记为 disabled
+            from datetime import datetime
+            now = datetime.now().isoformat()
+            with sqlite3.connect(str(store.db_path)) as conn:
+                conn.execute(
+                    "UPDATE accounts SET status = 'disabled', last_check = ?, updated_at = ? WHERE id = ?",
+                    (now, now, account_id),
+                )
+                conn.commit()
+            results["details"].append({
+                "id": account_id, "email": email,
+                "valid": False, "error": error_msg,
+            })
+
+        # 避免请求过快被限流
+        await asyncio.sleep(0.3)
+
+    logger.info(
+        "[VerifyQuota] Batch done: total=%d valid=%d invalid=%d",
+        total, results["valid"], results["invalid"],
+    )
+    return {"success": True, "results": results}
+
+
+@app.post("/api/accounts/{account_id}/verify-quota", dependencies=[Depends(verify_admin_token)])
+async def verify_single_quota(account_id: int):
+    """验证单个账号的真实额度（通过 token refresh 检测）"""
+    if not ACCOUNT_ADMIN_ENABLED:
+        raise HTTPException(status_code=403, detail="Account management is disabled")
+
+    from warp2protobuf.core.auth import refresh_access_token_with_refresh_token
+    import sqlite3
+
+    store = AccountStore(ACCOUNT_DB_PATH)
+
+    # 获取完整 token
+    with sqlite3.connect(str(store.db_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, email, refresh_token FROM accounts WHERE id = ?",
+            (account_id,),
+        )
+        row = cursor.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    email = row["email"]
+    refresh_token = row["refresh_token"]
+
+    if not refresh_token:
+        return {
+            "success": True,
+            "result": {"id": account_id, "email": email, "valid": False, "error": "missing refresh_token"},
+        }
+
+    try:
+        await refresh_access_token_with_refresh_token(refresh_token)
+        # 更新 last_check
+        from datetime import datetime
+        now = datetime.now().isoformat()
+        with sqlite3.connect(str(store.db_path)) as conn:
+            conn.execute(
+                "UPDATE accounts SET last_check = ?, updated_at = ? WHERE id = ?",
+                (now, now, account_id),
+            )
+            conn.commit()
+        return {
+            "success": True,
+            "result": {"id": account_id, "email": email, "valid": True, "error": None},
+        }
+    except Exception as e:
+        error_msg = str(e)[:200]
+        from datetime import datetime
+        now = datetime.now().isoformat()
+        with sqlite3.connect(str(store.db_path)) as conn:
+            conn.execute(
+                "UPDATE accounts SET status = 'disabled', last_check = ?, updated_at = ? WHERE id = ?",
+                (now, now, account_id),
+            )
+            conn.commit()
+        return {
+            "success": True,
+            "result": {"id": account_id, "email": email, "valid": False, "error": error_msg},
+        }
 
 
 @app.post("/api/tokens/refresh", dependencies=[Depends(verify_admin_token)])

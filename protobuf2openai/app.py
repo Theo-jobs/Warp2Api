@@ -273,8 +273,8 @@ async def batch_verify_quota():
                 "valid": False, "error": error_msg,
             })
 
-        # 避免请求过快被限流
-        await asyncio.sleep(0.3)
+        # 避免请求过快被 Firebase 限流
+        await asyncio.sleep(1.5)
 
     logger.info(
         "[VerifyQuota] Batch done: total=%d valid=%d invalid=%d",
@@ -345,6 +345,68 @@ async def verify_single_quota(account_id: int):
             "success": True,
             "result": {"id": account_id, "email": email, "valid": False, "error": error_msg},
         }
+
+
+class RegisterRequest(BaseModel):
+    count: int = 5
+    delay_s: float = 2.0
+    default_quota: int = 300
+
+
+@app.post("/api/accounts/register", dependencies=[Depends(verify_admin_token)])
+async def register_accounts(request: RegisterRequest):
+    """批量注册新 Warp 账号（Firebase email/password signUp）并自动入库"""
+    if not ACCOUNT_ADMIN_ENABLED:
+        raise HTTPException(status_code=403, detail="Account management is disabled")
+
+    if request.count < 1 or request.count > 50:
+        raise HTTPException(status_code=400, detail="count must be 1-50")
+
+    from warp2protobuf.core.account_register import batch_register
+
+    results = await batch_register(
+        count=request.count,
+        delay_s=request.delay_s,
+        default_quota=request.default_quota,
+    )
+
+    # 将成功注册的账号写入数据库
+    store = AccountStore(ACCOUNT_DB_PATH)
+    saved = 0
+    for r in results:
+        if r["success"] and r["account"]:
+            try:
+                store.upsert_account(r["account"])
+                saved += 1
+            except Exception as e:
+                logger.warning("[Register] Failed to save account: %s", e)
+
+    total_ok = sum(1 for r in results if r["success"])
+    total_fail = sum(1 for r in results if not r["success"])
+
+    logger.info(
+        "[Register] Batch register done: requested=%d success=%d fail=%d saved=%d",
+        request.count, total_ok, total_fail, saved,
+    )
+
+    return {
+        "success": True,
+        "message": f"Registered {total_ok} accounts, saved {saved} to database",
+        "stats": {
+            "requested": request.count,
+            "success": total_ok,
+            "failed": total_fail,
+            "saved_to_db": saved,
+        },
+        "details": [
+            {
+                "email": r["account"]["email"] if r["account"] else None,
+                "success": r["success"],
+                "error": r["error"],
+            }
+            for r in results
+        ],
+    }
 
 
 @app.post("/api/tokens/refresh", dependencies=[Depends(verify_admin_token)])

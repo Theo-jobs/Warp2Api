@@ -119,6 +119,16 @@
         .verify-progress .bar { height: 8px; background: #e9ecef; border-radius: 4px; overflow: hidden; margin: 10px 0; }
         .verify-progress .bar-fill { height: 100%; background: #28a745; transition: width 0.3s; }
         .verify-result { font-size: 13px; color: #666; margin-top: 8px; }
+        .modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); display: none; z-index: 100; justify-content: center; align-items: center; }
+        .modal { background: white; padding: 30px; border-radius: 12px; width: 420px; max-width: 90%; }
+        .modal h3 { margin-bottom: 15px; color: #333; }
+        .modal label { display: block; margin-bottom: 5px; font-size: 13px; color: #555; }
+        .modal input[type="number"] { width: 100%; padding: 8px 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; margin-bottom: 12px; }
+        .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 15px; }
+        .btn-success { background: #28a745; }
+        .btn-success:hover { background: #218838; }
+        .btn-secondary { background: #6c757d; }
+        .btn-secondary:hover { background: #5a6268; }
     </style>
 </head>
 <body>
@@ -171,6 +181,7 @@
             <button onclick="loadAccounts()">🔍 搜索</button>
             <button onclick="loadSummary()">🔄 刷新</button>
             <button onclick="batchVerifyQuota()" class="btn-warning" id="btn-verify">🔍 检查全部额度</button>
+            <button onclick="showRegisterModal()" class="btn-success" id="btn-register">➕ 注册新账号</button>
         </div>
 
         <div class="verify-progress" id="verify-progress">
@@ -223,6 +234,23 @@
         </table>
 
         <div class="pagination" id="pagination" style="display: none;"></div>
+    </div>
+
+    <div class="modal-overlay" id="register-modal" onclick="if(event.target===this)hideRegisterModal()">
+        <div class="modal">
+            <h3>➕ 批量注册 Warp 账号</h3>
+            <label>注册数量（1-50）</label>
+            <input type="number" id="reg-count" value="5" min="1" max="50">
+            <label>每次间隔（秒，防限流）</label>
+            <input type="number" id="reg-delay" value="2" min="1" max="10" step="0.5">
+            <label>默认额度</label>
+            <input type="number" id="reg-quota" value="300" min="1">
+            <div id="reg-status" style="font-size: 13px; color: #666; margin-top: 8px; display: none;"></div>
+            <div class="modal-actions">
+                <button class="btn-secondary" onclick="hideRegisterModal()">取消</button>
+                <button class="btn-success" id="btn-reg-submit" onclick="doRegister()">开始注册</button>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -511,6 +539,53 @@
             btn.disabled = false;
             btn.textContent = '🔍 检查全部额度';
             setTimeout(() => { progress.style.display = 'none'; }, 5000);
+        }
+
+        // 注册弹窗
+        function showRegisterModal() {
+            document.getElementById('register-modal').style.display = 'flex';
+            document.getElementById('reg-status').style.display = 'none';
+        }
+        function hideRegisterModal() {
+            document.getElementById('register-modal').style.display = 'none';
+        }
+        async function doRegister() {
+            const count = parseInt(document.getElementById('reg-count').value) || 5;
+            const delay = parseFloat(document.getElementById('reg-delay').value) || 2;
+            const quota = parseInt(document.getElementById('reg-quota').value) || 300;
+            const btn = document.getElementById('btn-reg-submit');
+            const status = document.getElementById('reg-status');
+
+            btn.disabled = true;
+            btn.textContent = '注册中...';
+            status.style.display = 'block';
+            status.textContent = `正在注册 ${count} 个账号，预计 ${Math.ceil(count * delay)} 秒...`;
+            status.style.color = '#666';
+
+            try {
+                const resp = await authFetch('/api/accounts/register', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ count, delay_s: delay, default_quota: quota }),
+                });
+                const data = await resp.json();
+                if (data.success) {
+                    const s = data.stats;
+                    status.style.color = '#155724';
+                    status.textContent = `✅ 完成！成功 ${s.success} 个，失败 ${s.failed} 个，已入库 ${s.saved_to_db} 个`;
+                    // 刷新列表
+                    loadSummary();
+                    loadAccounts(currentPage);
+                } else {
+                    status.style.color = '#721c24';
+                    status.textContent = '❌ ' + (data.detail || '注册失败');
+                }
+            } catch (e) {
+                status.style.color = '#721c24';
+                status.textContent = '❌ ' + e.message;
+            }
+            btn.disabled = false;
+            btn.textContent = '开始注册';
         }
 
         // 初始加载

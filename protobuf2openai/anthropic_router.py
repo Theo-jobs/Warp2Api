@@ -14,8 +14,10 @@ import sqlite3
 import uuid
 from typing import Any
 
+import requests
+
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from warp2protobuf.config.settings import (
     ACCOUNT_DB_PATH,
@@ -24,10 +26,11 @@ from warp2protobuf.config.settings import (
 from warp2protobuf.core.account_selector import AccountSelector
 from warp2protobuf.config.models import resolve_model
 
-from .anthropic_models import AnthropicMessagesRequest
+from .anthropic_models import AnthropicMessagesRequest, AnthropicUsage
 from .auth import authenticate_request
 from .anthropic_sse import stream_anthropic_sse
 from .bridge import initialize_once
+from .config import BRIDGE_BASE_URL
 from .helpers import normalize_content_to_list, segments_to_text
 from .models import ChatMessage
 from .packets import attach_user_and_tools_to_inputs, packet_template
@@ -97,7 +100,10 @@ def _tool_result_content_to_text(inner: Any) -> str:
         return segments_to_text(normalized_inner)
 
     if isinstance(inner, dict):
-        return segments_to_text(normalize_content_to_list(inner))
+        normalized = normalize_content_to_list(inner)
+        if normalized:
+            return segments_to_text(normalized)
+        return segments_to_text([inner])
 
     return str(inner)
 
@@ -319,12 +325,164 @@ def _serialize_history_to_text(history: list[ChatMessage]) -> str | None:
     )
 
 
+def _resolve_thinking_model(model: str, thinking_enabled: bool) -> str:
+    """Choose thinking variant model when requested and available.
+
+    - 4.5 系列：切换到独立的 -thinking 变体
+    - 4.6 系列：thinking 能力内置于 -high/-max，升级到 -max
+    - 其他模型：graceful degradation，忽略 thinking 而非报错
+    """
+    if not thinking_enabled:
+        return model
+
+    lower = model.lower()
+    if "thinking" in lower:
+        return model
+
+    # 4.5 系列：有独立 thinking 变体
+    if lower.startswith("claude-4-5-sonnet"):
+        return "claude-4-5-sonnet-thinking"
+    if lower.startswith("claude-4-5-opus"):
+        return "claude-4-5-opus-thinking"
+
+    # 4.6 系列：thinking 内置于 -high/-max，升级到 -max
+    if lower.startswith("claude-4-6-opus"):
+        logger.info("[thinking] 4.6 opus requested with thinking, using -max variant")
+        return "claude-4-6-opus-max"
+    if lower.startswith("claude-4-6-sonnet"):
+        logger.info("[thinking] 4.6 sonnet requested with thinking, using -max variant")
+        return "claude-4-6-sonnet-max"
+
+    # 其他模型：graceful degradation，不阻断请求
+    logger.warning(
+        "[thinking] no thinking variant for model '%s', proceeding without thinking",
+        model,
+    )
+    return model
+
+
+def _anthropic_nonstream_response_from_bridge(
+    bridge_resp: dict[str, Any],
+    model: str,
+) -> dict[str, Any]:
+    """Build Anthropic non-stream response from /api/warp/send_stream result."""
+    text_parts: list[str] = []
+    tool_blocks: list[dict[str, Any]] = []
+    stop_reason: str = "end_turn"
+
+    usage = AnthropicUsage()
+
+    parsed_events = bridge_resp.get("parsed_events")
+    if isinstance(parsed_events, list):
+        for ev in parsed_events:
+            parsed = ev.get("parsed_data") if isinstance(ev, dict) else {}
+            if not isinstance(parsed, dict):
+                continue
+
+            client_actions = parsed.get("client_actions") or parsed.get("clientActions")
+            actions = client_actions.get("actions", []) if isinstance(client_actions, dict) else []
+
+            for action in actions:
+                if not isinstance(action, dict):
+                    continue
+
+                append_data = action.get("append_to_message_content") or action.get("appendToMessageContent")
+                if isinstance(append_data, dict):
+                    message = append_data.get("message", {})
+                    if isinstance(message, dict):
+                        agent_output = message.get("agent_output") or message.get("agentOutput") or {}
+                        if isinstance(agent_output, dict):
+                            text = agent_output.get("text")
+                            if isinstance(text, str) and text:
+                                text_parts.append(text)
+
+                add_messages = action.get("add_messages_to_task") or action.get("addMessagesToTask")
+                if isinstance(add_messages, dict):
+                    for message in add_messages.get("messages", []):
+                        if not isinstance(message, dict):
+                            continue
+
+                        tool_call = message.get("tool_call") or message.get("toolCall") or {}
+                        call_mcp = tool_call.get("call_mcp_tool") or tool_call.get("callMcpTool") or {}
+                        if isinstance(call_mcp, dict) and call_mcp.get("name"):
+                            args_obj = call_mcp.get("args", {})
+                            args_obj = args_obj if isinstance(args_obj, dict) else {}
+                            tool_blocks.append({
+                                "type": "tool_use",
+                                "id": tool_call.get("tool_call_id") or f"toolu_{uuid.uuid4().hex[:24]}",
+                                "name": call_mcp.get("name", "unknown"),
+                                "input": args_obj,
+                            })
+
+            finished = parsed.get("finished")
+            if isinstance(finished, dict):
+                token_usage = finished.get("token_usage") or finished.get("tokenUsage") or []
+                if isinstance(token_usage, list) and token_usage:
+                    usage0 = token_usage[0] if isinstance(token_usage[0], dict) else {}
+                    total_input = usage0.get("total_input") or usage0.get("totalInput")
+                    output = usage0.get("output")
+                    input_cache_read = usage0.get("input_cache_read") or usage0.get("inputCacheRead")
+                    input_cache_write = usage0.get("input_cache_write") or usage0.get("inputCacheWrite")
+
+                    if isinstance(total_input, (int, float)):
+                        usage.input_tokens = max(0, int(total_input))
+                    if isinstance(output, (int, float)):
+                        usage.output_tokens = max(0, int(output))
+                    if isinstance(input_cache_read, (int, float)):
+                        usage.cache_read_input_tokens = max(0, int(input_cache_read))
+                    if isinstance(input_cache_write, (int, float)):
+                        usage.cache_creation_input_tokens = max(0, int(input_cache_write))
+
+                reason = finished.get("reason")
+                if isinstance(reason, dict):
+                    if "max_token_limit" in reason or "maxTokenLimit" in reason:
+                        stop_reason = "max_tokens"
+                    elif "context_window_exceeded" in reason or "contextWindowExceeded" in reason:
+                        stop_reason = "max_tokens"
+                    elif "quota_limit" in reason or "quotaLimit" in reason:
+                        stop_reason = "end_turn"
+                    elif "llm_unavailable" in reason or "llmUnavailable" in reason:
+                        stop_reason = "end_turn"
+                    elif "internal_error" in reason or "internalError" in reason:
+                        stop_reason = "end_turn"
+                    elif "done" in reason or "other" in reason:
+                        stop_reason = "tool_use" if tool_blocks else "end_turn"
+                    else:
+                        stop_reason = "tool_use" if tool_blocks else "end_turn"
+
+    text = "".join(text_parts).strip()
+
+    content_blocks: list[dict[str, Any]] = []
+    if text:
+        content_blocks.append({"type": "text", "text": text})
+    content_blocks.extend(tool_blocks)
+
+    if not content_blocks:
+        fallback_text = bridge_resp.get("response")
+        if isinstance(fallback_text, str) and fallback_text.strip():
+            content_blocks.append({"type": "text", "text": fallback_text})
+
+    if tool_blocks and stop_reason == "end_turn":
+        stop_reason = "tool_use"
+
+    return {
+        "id": f"msg_{uuid.uuid4().hex[:24]}",
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content_blocks,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": usage.model_dump(),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Main endpoint
 # ---------------------------------------------------------------------------
 
 @anthropic_router.post("/v1/messages")
-async def anthropic_messages(request: Request) -> StreamingResponse:
+async def anthropic_messages(request: Request) -> Any:
     """Handle Anthropic Messages API requests."""
     # --- Auth ---
     await authenticate_request(request)
@@ -346,14 +504,14 @@ async def anthropic_messages(request: Request) -> StreamingResponse:
 
     access_token = await token_mgr.get_valid_token(account)
 
-    # 如果当前账号 token 为空，尝试换号（最多 2 次）
+    # 如果当前账号 token 为空，尝试换号（最多 2 次），排除已尝试的账号
     _tried_ids: set[int] = {account["id"]}
     for _retry in range(2):
         if access_token:
             break
         logger.warning("[Anthropic] account_id=%d token 为空，尝试换号 (%d/2)", account["id"], _retry + 1)
-        account = selector.select_account()
-        if not account or account["id"] in _tried_ids:
+        account = selector.select_account(exclude_ids=_tried_ids)
+        if not account:
             break
         _tried_ids.add(account["id"])
         access_token = await token_mgr.get_valid_token(account)
@@ -386,7 +544,22 @@ async def anthropic_messages(request: Request) -> StreamingResponse:
 
     # --- Model mapping (use shared resolve_model, same as OpenAI router) ---
     warp_model = resolve_model(req.model)
-    logger.info("Anthropic model '%s' → Warp model '%s'", req.model, warp_model)
+
+    # thinking 配置：若请求启用 thinking 且模型存在 thinking 变体，则切换。
+    # 当前 protobuf request 不暴露 thinking budget 字段，budget 暂仅用于上层兼容验证。
+    thinking_budget_tokens = req.thinking.budget_tokens if req.thinking else None
+    if req.thinking and req.thinking.type != "enabled":
+        raise HTTPException(status_code=400, detail="Unsupported thinking.type; only 'enabled' is accepted")
+    thinking_enabled = bool(req.thinking)
+    warp_model = _resolve_thinking_model(warp_model, thinking_enabled)
+
+    logger.info(
+        "Anthropic model '%s' → Warp model '%s' (thinking=%s budget_tokens=%s)",
+        req.model,
+        warp_model,
+        thinking_enabled,
+        thinking_budget_tokens,
+    )
 
     # --- Convert messages ---
     raw_messages = [m if isinstance(m, dict) else m.model_dump() for m in req.messages]
@@ -446,32 +619,131 @@ async def anthropic_messages(request: Request) -> StreamingResponse:
             packet.setdefault("mcp_context", {}).setdefault("tools", []).extend(mcp_tools)
 
     logger.info(
-        "Anthropic request: model=%s, messages=%d (ChatMessage), tools=%d (mcp_context)",
+        "Anthropic request: model=%s, messages=%d (ChatMessage), tools=%d (mcp_context), stream=%s",
         req.model,
         len(chat_messages),
         len(openai_tools),
+        req.stream,
     )
 
-    # --- Stream response (with record_usage, mirrors router.py) ---
-    async def _stream_with_usage():
-        try:
-            async for chunk in stream_anthropic_sse(packet, model=req.model, access_token=access_token):
-                yield chunk
-            # 流式成功，记录使用
-            selector.record_usage(account_id, 1)
-        except Exception as exc:
-            logger.error("[Anthropic] stream error: %s", exc)
-            raise
+    if req.stream:
+        # --- Stream response (with record_usage + 429 retry) ---
+        _stream_access_token = access_token
+        _stream_account_id = account_id
 
-    return StreamingResponse(
-        _stream_with_usage(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+        async def _stream_with_usage():
+            nonlocal _stream_access_token, _stream_account_id
+            _chunk_idx = 0
+            _got_429 = False
+            _buffered: list[str] = []
+            try:
+                async for chunk in stream_anthropic_sse(packet, model=req.model, access_token=_stream_access_token):
+                    # bridge 429 在前几个 chunk 内出现（message_start → text_block → text_delta 含错误文本）
+                    if _chunk_idx < 6:
+                        _buffered.append(chunk)
+                        if "Bridge error: HTTP 429" in chunk:
+                            _got_429 = True
+                            break
+                        _chunk_idx += 1
+                        continue
+                    # 前几个 chunk 无 429，flush buffer 并正常流式输出
+                    if _buffered:
+                        for buf in _buffered:
+                            yield buf
+                        _buffered.clear()
+                    yield chunk
+
+                if not _got_429:
+                    # flush 残余 buffer（短响应可能不超过 6 个 chunk）
+                    for buf in _buffered:
+                        yield buf
+                    selector.record_usage(_stream_account_id, 1)
+                    return
+
+                # 429 换号重试
+                logger.warning("[Anthropic] stream 429 on account_id=%d, retrying", _stream_account_id)
+                token_mgr.mark_account_failed(_stream_account_id)
+                retry_account = selector.select_account(exclude_ids=_tried_ids)
+                if retry_account:
+                    retry_token = await token_mgr.get_valid_token(retry_account)
+                    if retry_token:
+                        _tried_ids.add(retry_account["id"])
+                        _stream_access_token = retry_token
+                        _stream_account_id = retry_account["id"]
+                        async with token_mgr.env_lock:
+                            os.environ["WARP_JWT"] = retry_token
+                        async for chunk in stream_anthropic_sse(packet, model=req.model, access_token=retry_token):
+                            yield chunk
+                        selector.record_usage(_stream_account_id, 1)
+                        return
+
+                # 换号失败，原样输出 429 错误
+                logger.error("[Anthropic] stream 429 retry failed, no more accounts")
+                yield 'event: error\ndata: {"type":"error","error":{"type":"rate_limit_error","message":"All accounts rate-limited"}}\n\n'
+
+            except Exception as exc:
+                logger.error("[Anthropic] stream error: %s", exc)
+                raise
+
+        return StreamingResponse(
+            _stream_with_usage(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    # --- Non-stream response ---
+    bridge_url = f"{BRIDGE_BASE_URL}/api/warp/send_stream"
+    req_body: dict[str, Any] = {
+        "json_data": packet,
+        "message_type": "warp.multi_agent.v1.Request",
+        "access_token": access_token,
+    }
+
+    try:
+        resp = requests.post(
+            bridge_url,
+            json=req_body,
+            timeout=(5.0, 180.0),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"bridge_unreachable: {exc}") from exc
+
+    # --- 429 限流换号重试 ---
+    if resp.status_code == 429:
+        logger.warning("[Anthropic] 429 rate-limited on account_id=%d, attempting retry", account_id)
+        token_mgr.mark_account_failed(account_id)
+        retry_account = selector.select_account(exclude_ids=_tried_ids)
+        if retry_account:
+            retry_token = await token_mgr.get_valid_token(retry_account)
+            if retry_token:
+                _tried_ids.add(retry_account["id"])
+                req_body["access_token"] = retry_token
+                async with token_mgr.env_lock:
+                    os.environ["WARP_JWT"] = retry_token
+                try:
+                    resp = requests.post(bridge_url, json=req_body, timeout=(5.0, 180.0))
+                    logger.info("[Anthropic] 429 retry succeeded with account_id=%d", retry_account["id"])
+                    account_id = retry_account["id"]
+                except Exception as exc:
+                    raise HTTPException(status_code=502, detail=f"bridge_unreachable on retry: {exc}") from exc
+
+    if resp.status_code != 200:
+        detail = resp.text[:300]
+        raise HTTPException(status_code=resp.status_code, detail=f"Bridge error: HTTP {resp.status_code} {detail}")
+
+    try:
+        bridge_resp = resp.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Invalid bridge response: {exc}") from exc
+
+    selector.record_usage(account_id, 1)
+
+    final_payload = _anthropic_nonstream_response_from_bridge(bridge_resp, req.model)
+    return JSONResponse(content=final_payload)
 
 
 async def build_streaming_response_for_account(

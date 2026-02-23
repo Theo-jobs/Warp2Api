@@ -5,9 +5,8 @@
 
 从 SQLite 数据库选择可用账号，并记录使用情况。
 """
-import random
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, Optional, Set
 
 from .account_store import AccountStore
 from .logging import logger
@@ -19,14 +18,18 @@ class AccountSelector:
     def __init__(self, db_path: str):
         self.store = AccountStore(db_path)
 
-    def select_account(self) -> Optional[Dict]:
+    def select_account(self, exclude_ids: Set[int] | None = None) -> Optional[Dict]:
         """
         选择一个可用账号（轮询策略）
 
         优先级：
         1. 有剩余额度（remaining_limit > 0）
         2. 状态为 available
-        3. 最少使用次数（use_count 最小）
+        3. 排除 exclude_ids 中的账号（用于换号重试）
+        4. 最少使用次数（use_count 最小）
+
+        Args:
+            exclude_ids: 需要排除的账号 ID 集合（已尝试过的）
 
         Returns:
             账号字典（包含完整 token），如果无可用账号则返回 None
@@ -37,17 +40,30 @@ class AccountSelector:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
 
-            # 查询可用账号（有额度 + 状态可用）
-            cursor.execute("""
-                SELECT
-                    id, email, local_id, id_token, refresh_token, api_key,
-                    total_limit, used_limit, use_count, last_used
-                FROM accounts
-                WHERE status = 'available'
-                  AND (total_limit - used_limit) > 0
-                ORDER BY use_count ASC, last_used ASC NULLS FIRST
-                LIMIT 1
-            """)
+            if exclude_ids:
+                placeholders = ",".join("?" for _ in exclude_ids)
+                cursor.execute(f"""
+                    SELECT
+                        id, email, local_id, id_token, refresh_token, api_key,
+                        total_limit, used_limit, use_count, last_used
+                    FROM accounts
+                    WHERE status = 'available'
+                      AND (total_limit - used_limit) > 0
+                      AND id NOT IN ({placeholders})
+                    ORDER BY use_count ASC, last_used ASC NULLS FIRST
+                    LIMIT 1
+                """, list(exclude_ids))
+            else:
+                cursor.execute("""
+                    SELECT
+                        id, email, local_id, id_token, refresh_token, api_key,
+                        total_limit, used_limit, use_count, last_used
+                    FROM accounts
+                    WHERE status = 'available'
+                      AND (total_limit - used_limit) > 0
+                    ORDER BY use_count ASC, last_used ASC NULLS FIRST
+                    LIMIT 1
+                """)
 
             row = cursor.fetchone()
             if not row:

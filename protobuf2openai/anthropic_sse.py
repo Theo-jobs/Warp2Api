@@ -11,10 +11,9 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 import uuid
-from dataclasses import dataclass, field
-from typing import AsyncGenerator
+from dataclasses import dataclass
+from typing import Any, AsyncGenerator
 
 import httpx
 
@@ -48,17 +47,20 @@ def _gen_tool_use_id() -> str:
 @dataclass
 class AnthropicSseState:
     """跟踪 Anthropic SSE 流的状态。"""
+
     model: str = "claude-sonnet-4-20250514"
     message_id: str = ""
     block_index: int = 0
-    block_type: str = ""          # "text" | "tool_use" | ""
+    block_type: str = ""  # "text" | "tool_use" | ""
     current_tool_id: str = ""
     current_tool_name: str = ""
-    input_json_buf: str = ""      # tool_use 的 input JSON 累积
+    input_json_buf: str = ""  # tool_use 的 input JSON 累积
     started: bool = False
-    has_tool_use: bool = False     # 是否曾经发射过 tool_use block
+    has_tool_use: bool = False  # 是否曾经发射过 tool_use block
     input_tokens: int = 0
     output_tokens: int = 0
+    stop_sequence: str | None = None
+    finish_reason: dict[str, Any] | None = None
 
     def next_block_index(self) -> int:
         idx = self.block_index
@@ -157,7 +159,7 @@ def _close_tool_use_block(state: AnthropicSseState) -> str:
 def _emit_message_delta(state: AnthropicSseState, stop_reason: str = "end_turn") -> str:
     return _sse_line("message_delta", {
         "type": "message_delta",
-        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+        "delta": {"stop_reason": stop_reason, "stop_sequence": state.stop_sequence},
         "usage": {"output_tokens": state.output_tokens},
     })
 
@@ -170,6 +172,56 @@ def _emit_message_stop() -> str:
 # 流结束处理
 # ---------------------------------------------------------------------------
 
+def _map_finished_stop_reason(state: AnthropicSseState) -> str:
+    """Map Warp finished reason into Anthropic stop_reason."""
+    reason = state.finish_reason or {}
+
+    if not isinstance(reason, dict):
+        return "tool_use" if state.has_tool_use else "end_turn"
+
+    if "max_token_limit" in reason or "maxTokenLimit" in reason:
+        return "max_tokens"
+    if "quota_limit" in reason or "quotaLimit" in reason:
+        return "end_turn"
+    if "context_window_exceeded" in reason or "contextWindowExceeded" in reason:
+        return "max_tokens"
+    if "llm_unavailable" in reason or "llmUnavailable" in reason:
+        return "end_turn"
+    if "internal_error" in reason or "internalError" in reason:
+        return "end_turn"
+    if "done" in reason or "other" in reason:
+        return "tool_use" if state.has_tool_use else "end_turn"
+
+    if state.has_tool_use:
+        return "tool_use"
+    return "end_turn"
+
+
+def _ingest_finished_usage(finished: dict[str, Any], state: AnthropicSseState) -> None:
+    """Extract token usage and stop metadata from finished event."""
+    token_usage = finished.get("token_usage") or finished.get("tokenUsage") or []
+    if isinstance(token_usage, list) and token_usage:
+        usage0 = token_usage[0] if isinstance(token_usage[0], dict) else {}
+        total_input = usage0.get("total_input") or usage0.get("totalInput")
+        output = usage0.get("output")
+
+        try:
+            if isinstance(total_input, (int, float)):
+                state.input_tokens = max(0, int(total_input))
+        except Exception:
+            pass
+
+        try:
+            if isinstance(output, (int, float)):
+                state.output_tokens = max(0, int(output))
+        except Exception:
+            pass
+
+    reason = finished.get("reason")
+    if isinstance(reason, dict):
+        state.finish_reason = reason
+
+
 def _finalize(state: AnthropicSseState) -> list[str]:
     """流结束时，关闭所有未关闭的 block 并发送结束事件。"""
     parts: list[str] = []
@@ -178,8 +230,7 @@ def _finalize(state: AnthropicSseState) -> list[str]:
     elif state.block_type == "tool_use":
         parts.append(_close_tool_use_block(state))
 
-    stop_reason = "tool_use" if state.has_tool_use else "end_turn"
-    # 简单判断：如果 block_index > 1 或者有 tool block 被关闭过
+    stop_reason = _map_finished_stop_reason(state)
     parts.append(_emit_message_delta(state, stop_reason))
     parts.append(_emit_message_stop())
     return parts
@@ -410,13 +461,21 @@ async def stream_anthropic_sse(
 
                         # 检查 finished 事件
                         if "finished" in event_data:
+                            finished = event_data.get("finished")
+                            if isinstance(finished, dict):
+                                _ingest_finished_usage(finished, state)
                             logger.info("[anthropic_sse] 收到 finished 事件，结束流")
                             break
 
                 # ---- 流结束，finalize ----
                 logger.info(
-                    "[anthropic_sse] 流结束: events=%d blocks=%d has_tool_use=%s output_tokens=%d",
-                    _event_count, state.block_index, state.has_tool_use, state.output_tokens,
+                    "[anthropic_sse] 流结束: events=%d blocks=%d has_tool_use=%s input_tokens=%d output_tokens=%d reason=%s",
+                    _event_count,
+                    state.block_index,
+                    state.has_tool_use,
+                    state.input_tokens,
+                    state.output_tokens,
+                    state.finish_reason,
                 )
                 for p in _finalize(state):
                     yield p

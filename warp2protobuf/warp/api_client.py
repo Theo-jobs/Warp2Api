@@ -22,6 +22,7 @@ from ..config.settings import (
     OS_NAME,
     OS_VERSION,
     WARP_URL as CONFIG_WARP_URL,
+    TLS_VERIFY,
 )
 from ..core.auth import get_valid_jwt
 from ..core.logging import logger
@@ -44,28 +45,44 @@ class WarpSseRequest:
         self.protobuf_bytes = protobuf_bytes
         self.access_token = access_token
         self.headers = _build_headers(access_token, protobuf_bytes)
-        self.verify_opt = _resolve_tls_verify()
+        self.verify_opt = TLS_VERIFY
 
     async def iter_lines(self) -> AsyncGenerator[str, None]:
         async with httpx.AsyncClient(
             http2=True,
             timeout=httpx.Timeout(60.0),
             verify=self.verify_opt,
-            trust_env=True,
+            trust_env=False,
         ) as client:
-            async with client.stream(
-                "POST",
-                CONFIG_WARP_URL,
-                headers=self.headers,
-                content=self.protobuf_bytes,
-            ) as response:
-                if response.status_code != 200:
-                    error_text = await response.aread()
-                    error_content = error_text.decode("utf-8") if error_text else ""
-                    raise WarpApiHttpError(response.status_code, error_content)
+            for attempt in range(2):
+                headers = self.headers if attempt == 0 else _build_headers(self.access_token, self.protobuf_bytes)
+                async with client.stream(
+                    "POST",
+                    CONFIG_WARP_URL,
+                    headers=headers,
+                    content=self.protobuf_bytes,
+                ) as response:
+                    if response.status_code != 200:
+                        error_text = await response.aread()
+                        error_content = error_text.decode("utf-8") if error_text else ""
 
-                async for line in response.aiter_lines():
-                    yield line
+                        # 429 配额耗尽：尝试申请匿名 token 并重试一次
+                        if attempt == 0 and is_quota_429(response.status_code, error_content):
+                            logger.warning("WARP API 429 (配额用尽)，尝试申请匿名 token 重试…")
+                            try:
+                                from ..core.auth import acquire_anonymous_access_token
+                                new_jwt = await acquire_anonymous_access_token()
+                                if new_jwt:
+                                    self.access_token = new_jwt
+                                    continue
+                            except Exception as e:
+                                logger.error("匿名 token 申请失败: %s", e)
+
+                        raise WarpApiHttpError(response.status_code, error_content)
+
+                    async for line in response.aiter_lines():
+                        yield line
+                    return  # 成功完成，退出重试循环
 
 
 def _get(d: Dict[str, Any], *names: str) -> Any:
@@ -205,7 +222,7 @@ async def _send_and_parse(
     collect_parsed_events: bool,
 ) -> tuple[str, Optional[str], Optional[str], list[dict[str, Any]]]:
     warp_url = CONFIG_WARP_URL
-    verify_opt = _resolve_tls_verify()
+    verify_opt = TLS_VERIFY
 
     jwt = access_token or await get_valid_jwt()
     headers = _build_headers(jwt, protobuf_bytes)
@@ -220,69 +237,86 @@ async def _send_and_parse(
         http2=True,
         timeout=httpx.Timeout(60.0),
         verify=verify_opt,
-        trust_env=True,
+        trust_env=False,
     ) as client:
-        async with client.stream("POST", warp_url, headers=headers, content=protobuf_bytes) as response:
-            if response.status_code != 200:
-                error_text = await response.aread()
-                error_content = error_text.decode("utf-8") if error_text else ""
-                raise WarpApiHttpError(response.status_code, error_content)
+        for attempt in range(2):
+            if attempt > 0:
+                headers = _build_headers(jwt, protobuf_bytes)
+            async with client.stream("POST", warp_url, headers=headers, content=protobuf_bytes) as response:
+                if response.status_code != 200:
+                    error_text = await response.aread()
+                    error_content = error_text.decode("utf-8") if error_text else ""
 
-            logger.info(f"✅ 收到HTTP {response.status_code}响应")
-            logger.info("开始处理SSE事件流...")
+                    # 429 配额耗尽：尝试申请匿名 token 并重试一次
+                    if attempt == 0 and is_quota_429(response.status_code, error_content):
+                        logger.warning("WARP API 429 (配额用尽)，尝试申请匿名 token 重试…")
+                        try:
+                            from ..core.auth import acquire_anonymous_access_token
+                            new_jwt = await acquire_anonymous_access_token()
+                            if new_jwt:
+                                jwt = new_jwt
+                                continue
+                        except Exception as e:
+                            logger.error("匿名 token 申请失败: %s", e)
 
-            current_data = ""
-            async for line in response.aiter_lines():
-                if line.startswith("data:"):
-                    payload = line[5:].strip()
-                    if not payload:
+                    raise WarpApiHttpError(response.status_code, error_content)
+
+                logger.info(f"✅ 收到HTTP {response.status_code}响应")
+                logger.info("开始处理SSE事件流...")
+
+                current_data = ""
+                async for line in response.aiter_lines():
+                    if line.startswith("data:"):
+                        payload = line[5:].strip()
+                        if not payload:
+                            continue
+                        if payload == "[DONE]":
+                            logger.info("收到[DONE]标记，结束处理")
+                            break
+                        current_data += payload
                         continue
-                    if payload == "[DONE]":
-                        logger.info("收到[DONE]标记，结束处理")
-                        break
-                    current_data += payload
-                    continue
 
-                if (line.strip() == "") and current_data:
-                    raw_bytes = _parse_payload_bytes(current_data)
-                    current_data = ""
-                    if raw_bytes is None:
-                        logger.debug("跳过无法解析的SSE数据块（非hex/base64或不完整）")
-                        continue
+                    if (line.strip() == "") and current_data:
+                        raw_bytes = _parse_payload_bytes(current_data)
+                        current_data = ""
+                        if raw_bytes is None:
+                            logger.debug("跳过无法解析的SSE数据块（非hex/base64或不完整）")
+                            continue
 
-                    try:
-                        event_data = protobuf_to_dict(raw_bytes, "warp.multi_agent.v1.ResponseEvent")
-                    except Exception as parse_error:
-                        logger.debug(f"解析事件失败，跳过: {str(parse_error)[:100]}")
-                        continue
+                        try:
+                            event_data = protobuf_to_dict(raw_bytes, "warp.multi_agent.v1.ResponseEvent")
+                        except Exception as parse_error:
+                            logger.debug(f"解析事件失败，跳过: {str(parse_error)[:100]}")
+                            continue
 
-                    event_count += 1
-                    event_type = _get_event_type(event_data)
+                        event_count += 1
+                        event_type = _get_event_type(event_data)
 
-                    if collect_parsed_events:
-                        parsed_events.append(
-                            {
-                                "event_number": event_count,
-                                "event_type": event_type,
-                                "parsed_data": event_data,
-                            }
+                        if collect_parsed_events:
+                            parsed_events.append(
+                                {
+                                    "event_number": event_count,
+                                    "event_type": event_type,
+                                    "parsed_data": event_data,
+                                }
+                            )
+
+                        logger.info(f"🔄 Event #{event_count}: {event_type}")
+                        if show_all_events:
+                            logger.info(f"   📋 Event data: {str(event_data)}...")
+
+                        if "init" in event_data:
+                            init_data = event_data["init"]
+                            conversation_id = init_data.get("conversation_id", conversation_id)
+                            task_id = init_data.get("task_id", task_id)
+                            logger.info(f"会话初始化: {conversation_id}")
+
+                        task_id = _extract_text_from_event(
+                            event_data=event_data,
+                            current_task_id=task_id,
+                            complete_response=complete_response,
                         )
-
-                    logger.info(f"🔄 Event #{event_count}: {event_type}")
-                    if show_all_events:
-                        logger.info(f"   📋 Event data: {str(event_data)}...")
-
-                    if "init" in event_data:
-                        init_data = event_data["init"]
-                        conversation_id = init_data.get("conversation_id", conversation_id)
-                        task_id = init_data.get("task_id", task_id)
-                        logger.info(f"会话初始化: {conversation_id}")
-
-                    task_id = _extract_text_from_event(
-                        event_data=event_data,
-                        current_task_id=task_id,
-                        complete_response=complete_response,
-                    )
+                break  # 成功处理完毕，退出重试循环
 
     full_response = "".join(complete_response)
     logger.info("=" * 60)

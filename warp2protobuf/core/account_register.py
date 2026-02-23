@@ -6,7 +6,9 @@ Warp 账号注册模块
 正确流程：
 1. CreateAnonymousUser (Warp GraphQL) → 在 Warp 后端创建用户 + 获取 Firebase custom token
 2. signInWithCustomToken (Firebase) → 换取 refreshToken
-3. accounts:update (Firebase) → 绑定 email/password（可选，使账号可用邮箱登录）
+3. accounts:update (Firebase) → 绑定 email/password（可选，默认跳过）
+4. GetOrCreateUser (Warp GraphQL) → 在 Warp 后端激活用户（关键！缺少此步会 400）
+5. proxy/token (Warp) → 用 refreshToken 换取 access_token（用于 AI 请求）
 
 每个新账号自动获得 ~300 次 AI 请求额度。
 """
@@ -25,6 +27,10 @@ from ..config.settings import (
     OS_CATEGORY,
     OS_NAME,
     OS_VERSION,
+    PROXY_URL,
+    REFRESH_URL,
+    TLS_VERIFY,
+    proxy_for_url,
 )
 from .logging import logger
 
@@ -34,6 +40,9 @@ _ANON_GQL_URL_DIRECT = "https://app.warp.dev/graphql/v2?op=CreateAnonymousUser"
 _ANON_GQL_URL_PROXY = "http://127.0.0.1:28887/graphql/v2?op=CreateAnonymousUser"
 _SIGNIN_URL = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key={_FIREBASE_API_KEY}"
 _UPDATE_URL = f"https://identitytoolkit.googleapis.com/v1/accounts:update?key={_FIREBASE_API_KEY}"
+# GetOrCreateUser 走 rustls proxy 激活 Warp 用户（缺少此步新账号 AI 请求会 400）
+_GETORCREATE_URL_DIRECT = "https://app.warp.dev/graphql/v2?op=GetOrCreateUser"
+_GETORCREATE_URL_PROXY = "http://127.0.0.1:28887/graphql/v2?op=GetOrCreateUser"
 
 _EMAIL_DOMAINS = [
     "icloud.com", "icloud.com", "icloud.com",
@@ -50,6 +59,7 @@ class RegisteredAccount:
     local_id: str
     id_token: str
     refresh_token: str
+    access_token: str = ""  # Warp access_token（用于 AI 请求）
 
 
 def _random_email() -> str:
@@ -66,12 +76,61 @@ def _warp_headers() -> dict:
     return {
         "content-type": "application/json",
         "accept-encoding": "gzip, br",
-        "x-warp-client-id": CLIENT_ID,
         "x-warp-client-version": CLIENT_VERSION,
         "x-warp-os-category": OS_CATEGORY,
         "x-warp-os-name": OS_NAME,
         "x-warp-os-version": OS_VERSION,
     }
+
+
+class _CurlResponse:
+    """Minimal response object to match httpx interface for curl fallback."""
+    def __init__(self, status_code: int, body: bytes):
+        self.status_code = status_code
+        self._body = body
+
+    def json(self) -> dict:
+        import json as _json
+        return _json.loads(self._body)
+
+
+async def _step1_via_curl(body: dict) -> _CurlResponse:
+    """Fallback: 用 curl 走 HTTP 代理发 GraphQL（httpx 与 Stash CONNECT 不兼容）"""
+    import asyncio
+    import json as _json
+
+    json_str = _json.dumps(body)
+    headers = _warp_headers()
+    cmd = [
+        "curl", "-s", "-w", "\n%{http_code}",
+        "-x", PROXY_URL,
+        "--connect-timeout", "15",
+        "-X", "POST",
+        _ANON_GQL_URL_DIRECT,
+    ]
+    for k, v in headers.items():
+        cmd.extend(["-H", f"{k}: {v}"])
+    cmd.extend(["-d", json_str])
+
+    if not TLS_VERIFY:
+        cmd.append("-k")
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+    output = stdout.decode("utf-8", errors="replace").strip()
+
+    # 最后一行是 http_code
+    lines = output.rsplit("\n", 1)
+    if len(lines) == 2:
+        body_str, code_str = lines
+    else:
+        body_str, code_str = output, "0"
+
+    status_code = int(code_str) if code_str.isdigit() else 0
+    logger.info("[Register] Step1 curl → HTTP %d (proxy=%s)", status_code, PROXY_URL)
+    return _CurlResponse(status_code, body_str.encode("utf-8"))
 
 
 async def _step1_create_anonymous_user() -> str:
@@ -103,18 +162,35 @@ async def _step1_create_anonymous_user() -> str:
     }
     body = {"query": query, "variables": variables, "operationName": "CreateAnonymousUser"}
 
-    # 优先走 rustls proxy，失败则直连
-    for url in [_ANON_GQL_URL_PROXY, _ANON_GQL_URL_DIRECT]:
+    # 策略：rustls proxy → 直连 → curl 走 HTTP 代理（httpx 与 Stash CONNECT 不兼容）
+    endpoints = [_ANON_GQL_URL_PROXY, _ANON_GQL_URL_DIRECT]
+
+    resp = None
+    for url in endpoints:
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+            client_kwargs: dict = {"timeout": httpx.Timeout(30.0), "verify": TLS_VERIFY, "trust_env": False}
+            _proxy = proxy_for_url(url)
+            if _proxy:
+                client_kwargs["proxy"] = _proxy
+            async with httpx.AsyncClient(**client_kwargs) as client:
                 resp = await client.post(url, headers=_warp_headers(), json=body)
             if resp.status_code == 200:
                 break
-            logger.warning("[Register] Step1 %s → HTTP %d", url[:40], resp.status_code)
+            logger.warning("[Register] Step1 %s (proxy=%s) → HTTP %d", url[:40], _proxy or "direct", resp.status_code)
         except Exception as e:
             logger.warning("[Register] Step1 %s → %s", url[:40], str(e)[:100])
-    else:
-        raise RuntimeError(f"CreateAnonymousUser failed on all endpoints: HTTP {resp.status_code}")
+
+    # httpx 全部 429/失败时，尝试 curl 走 HTTP 代理（换 IP 绕限流）
+    if (resp is None or resp.status_code != 200) and PROXY_URL:
+        logger.info("[Register] Step1 httpx failed, trying curl via proxy %s", PROXY_URL)
+        try:
+            resp = await _step1_via_curl(body)
+        except Exception as e:
+            logger.warning("[Register] Step1 curl fallback → %s", str(e)[:150])
+
+    if resp is None or resp.status_code != 200:
+        code = resp.status_code if resp is not None else 0
+        raise RuntimeError(f"CreateAnonymousUser failed on all endpoints: HTTP {code}")
 
     data = resp.json()
     result = data.get("data", {}).get("createAnonymousUser", {})
@@ -140,7 +216,11 @@ async def _step2_signin_custom_token(id_token: str) -> tuple[str, str, str]:
     }
     form = {"returnSecureToken": "true", "token": id_token}
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+    client_kwargs: dict = {"timeout": httpx.Timeout(30.0), "verify": TLS_VERIFY, "trust_env": False}
+    _proxy = proxy_for_url(_SIGNIN_URL)
+    if _proxy:
+        client_kwargs["proxy"] = _proxy
+    async with httpx.AsyncClient(**client_kwargs) as client:
         resp = await client.post(_SIGNIN_URL, headers=headers, data=form)
 
     if resp.status_code != 200:
@@ -173,8 +253,43 @@ async def _step2_signin_custom_token(id_token: str) -> tuple[str, str, str]:
     return session_token, refresh_token, local_id
 
 
-async def _step3_bind_email(session_token: str, email: str, password: str) -> tuple[str, str]:
-    """Step 3: accounts:update → 绑定 email/password，返回 (new_id_token, new_refresh_token)"""
+async def _step3_exchange_access_token(refresh_token: str) -> str:
+    """Step 3: proxy/token → 用 refreshToken 换取 Warp access_token（关键步骤！）"""
+    payload = f"grant_type=refresh_token&refresh_token={refresh_token}".encode("utf-8")
+    headers = {
+        "x-warp-client-id": CLIENT_ID,
+        "x-warp-client-version": CLIENT_VERSION,
+        "x-warp-os-category": OS_CATEGORY,
+        "x-warp-os-name": OS_NAME,
+        "x-warp-os-version": OS_VERSION,
+        "content-type": "application/x-www-form-urlencoded",
+        "accept": "*/*",
+        "accept-encoding": "gzip, br",
+        "content-length": str(len(payload)),
+    }
+
+    client_kwargs: dict = {"timeout": httpx.Timeout(30.0), "verify": TLS_VERIFY, "trust_env": False}
+    _proxy = proxy_for_url(REFRESH_URL)
+    if _proxy:
+        client_kwargs["proxy"] = _proxy
+
+    async with httpx.AsyncClient(**client_kwargs) as client:
+        resp = await client.post(REFRESH_URL, headers=headers, content=payload)
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"proxy/token exchange failed: HTTP {resp.status_code} {resp.text[:200]}")
+
+    token_data = resp.json()
+    access_token = token_data.get("access_token")
+    if not access_token:
+        raise RuntimeError(f"proxy/token response missing access_token: {token_data}")
+
+    logger.info("[Register] Step3 OK: access_token obtained (len=%d)", len(access_token))
+    return access_token
+
+
+async def _step4_bind_email(session_token: str, email: str, password: str) -> tuple[str, str]:
+    """Step 4 (可选): accounts:update → 绑定 email/password，返回 (new_id_token, new_refresh_token)"""
     payload = {
         "idToken": session_token,
         "email": email,
@@ -182,33 +297,149 @@ async def _step3_bind_email(session_token: str, email: str, password: str) -> tu
         "returnSecureToken": True,
     }
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
-        resp = await client.post(_UPDATE_URL, json=payload)
+    try:
+        client_kwargs: dict = {"timeout": httpx.Timeout(30.0), "verify": TLS_VERIFY, "trust_env": False}
+        _proxy = proxy_for_url(_UPDATE_URL)
+        if _proxy:
+            client_kwargs["proxy"] = _proxy
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            resp = await client.post(_UPDATE_URL, json=payload)
 
-    if resp.status_code != 200:
-        logger.warning("[Register] Step3 bind email failed: HTTP %d %s", resp.status_code, resp.text[:200])
+        if resp.status_code != 200:
+            logger.warning("[Register] Step3 bind email failed: HTTP %d %s", resp.status_code, resp.text[:200])
+            return "", ""
+
+        data = resp.json()
+        logger.info("[Register] Step3 OK: email=%s bound", email)
+        return data.get("idToken", ""), data.get("refreshToken", "")
+    except Exception as e:
+        logger.warning("[Register] Step3 bind email error (non-fatal): %s", str(e)[:150])
         return "", ""
 
+
+async def _step5_get_or_create_user(id_token: str) -> tuple[str, bool]:
+    """Step 5: GetOrCreateUser GraphQL → 在 Warp 后端激活用户（关键步骤！）
+
+    缺少此步骤，新注册账号的 AI 请求会返回 400。
+    参考项目 batch_register.py 中的 _activate_warp_user() 实现。
+
+    Args:
+        id_token: Firebase ID Token（绑定 email 后的新 token 或原始 session_token）
+
+    Returns:
+        (uid, is_onboarded) — Warp 用户 UID 和 onboard 状态
+    """
+    import uuid as _uuid
+
+    session_id = str(_uuid.uuid4())
+
+    query = (
+        "mutation GetOrCreateUser("
+        "$input: GetOrCreateUserInput!, $requestContext: RequestContext!) { "
+        "getOrCreateUser(requestContext: $requestContext, input: $input) { "
+        "__typename "
+        "... on GetOrCreateUserOutput { uid isOnboarded __typename } "
+        "... on UserFacingError { error { message __typename } __typename } "
+        "} }"
+    )
+    body = {
+        "operationName": "GetOrCreateUser",
+        "variables": {
+            "input": {"sessionId": session_id},
+            "requestContext": {
+                "clientContext": {"version": CLIENT_VERSION},
+                "osContext": {
+                    "category": OS_CATEGORY,
+                    "linuxKernelVersion": None,
+                    "name": OS_NAME,
+                    "version": OS_VERSION,
+                },
+            },
+        },
+        "query": query,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {id_token}",
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.6778.205 Safari/537.36"
+        ),
+        "x-warp-client-version": CLIENT_VERSION,
+        "x-warp-os-category": OS_CATEGORY,
+        "x-warp-os-name": OS_NAME,
+        "x-warp-os-version": OS_VERSION,
+    }
+
+    # 优先走 rustls proxy，失败则直连
+    endpoints = [_GETORCREATE_URL_PROXY, _GETORCREATE_URL_DIRECT]
+    resp = None
+    for url in endpoints:
+        try:
+            client_kwargs: dict = {
+                "timeout": httpx.Timeout(30.0),
+                "verify": TLS_VERIFY,
+                "trust_env": False,
+            }
+            _proxy = proxy_for_url(url)
+            if _proxy:
+                client_kwargs["proxy"] = _proxy
+            async with httpx.AsyncClient(**client_kwargs) as client:
+                resp = await client.post(url, headers=headers, json=body)
+            if resp.status_code == 200:
+                break
+            body_preview = (resp.text or "")[:300]
+            logger.warning(
+                "[Register] Step5 %s → HTTP %d: %s", url[:50], resp.status_code, body_preview
+            )
+        except Exception as e:
+            logger.warning("[Register] Step5 %s → %s", url[:50], str(e)[:100])
+
+    if resp is None or resp.status_code != 200:
+        code = resp.status_code if resp is not None else 0
+        raise RuntimeError(f"GetOrCreateUser failed on all endpoints: HTTP {code}")
+
     data = resp.json()
-    logger.info("[Register] Step3 OK: email=%s bound", email)
-    return data.get("idToken", ""), data.get("refreshToken", "")
+    result = data.get("data", {}).get("getOrCreateUser", {})
+    typename = result.get("__typename", "")
+
+    if typename == "GetOrCreateUserOutput":
+        uid = result.get("uid", "")
+        is_onboarded = result.get("isOnboarded", False)
+        logger.info("[Register] Step5 OK: uid=%s onboarded=%s", uid[:12] if uid else "?", is_onboarded)
+        return uid, is_onboarded
+
+    # UserFacingError
+    error_msg = result.get("error", {}).get("message", str(data)[:200])
+    raise RuntimeError(f"GetOrCreateUser error: {error_msg}")
 
 
 async def register_account(
     email: Optional[str] = None,
     password: Optional[str] = None,
+    bind_email: bool = True,
 ) -> RegisteredAccount:
     """
     注册一个新的 Warp 账号
 
-    流程：CreateAnonymousUser → signInWithCustomToken → 绑定 email/password
+    流程：
+    1. CreateAnonymousUser → 获取 Firebase custom token
+    2. signInWithCustomToken → 获取 refreshToken
+    3. accounts:update → 绑定 email/password（必须紧跟 step 2，否则 CREDENTIAL_TOO_OLD）
+    4. GetOrCreateUser → 在 Warp 后端激活用户（关键！缺少会导致 AI 请求 400）
+    5. proxy/token → 用绑定后的 refreshToken 换取 Warp access_token
+
+    注意：Warp AI 请求要求账号有 email（sign_in_provider=password），
+    纯匿名账号（sign_in_provider=custom）会被 400 拒绝。
 
     Args:
         email: 邮箱地址，为空则随机生成
         password: 密码，为空则随机生成
+        bind_email: 是否绑定邮箱（默认 True，Warp 要求有 email 才能用 AI）
 
     Returns:
-        RegisteredAccount 包含完整凭证
+        RegisteredAccount 包含完整凭证（含 access_token）
     """
     email = email or _random_email()
     password = password or _random_password()
@@ -219,20 +450,35 @@ async def register_account(
     # Step 2: 换取 Firebase session
     session_token, refresh_token, local_id = await _step2_signin_custom_token(custom_token)
 
-    # Step 3: 绑定 email/password
-    new_id_token, new_refresh = await _step3_bind_email(session_token, email, password)
+    # Step 3: 绑定 email/password（必须紧跟 step 2，延迟会导致 CREDENTIAL_TOO_OLD）
+    final_refresh = refresh_token
+    activation_token = session_token  # 用于 step 4 的 GetOrCreateUser
+    if bind_email:
+        new_id_token, new_refresh = await _step4_bind_email(session_token, email, password)
+        if new_refresh:
+            final_refresh = new_refresh
+            logger.info("[Register] Step3 email bound: %s", email)
+        else:
+            logger.warning("[Register] Step3 email bind failed, using original refresh_token")
+        # 绑定成功时用新 id_token 激活，否则用原始 session_token
+        if new_id_token:
+            activation_token = new_id_token
 
-    # 优先使用绑定后的 token
-    final_id_token = new_id_token or session_token
-    final_refresh = new_refresh or refresh_token
+    # Step 4: 在 Warp 后端激活用户（关键步骤！缺少此步 AI 请求会 400）
+    await _step5_get_or_create_user(activation_token)
 
-    logger.info("[Register] Account ready: email=%s local_id=%s", email, local_id[:12])
+    # Step 5: 用 refreshToken 换取 Warp access_token（用绑定后的 refresh_token）
+    access_token = await _step3_exchange_access_token(final_refresh)
+
+    logger.info("[Register] Account ready: email=%s local_id=%s has_access_token=%s",
+                email, local_id[:12], bool(access_token))
 
     return RegisteredAccount(
         email=email,
         local_id=local_id,
-        id_token=final_id_token,
+        id_token=session_token,
         refresh_token=final_refresh,
+        access_token=access_token,
     )
 
 
@@ -264,7 +510,7 @@ async def batch_register(
                 "account": {
                     "email": acc.email,
                     "local_id": acc.local_id,
-                    "id_token": acc.id_token,
+                    "id_token": acc.access_token or acc.id_token,
                     "refresh_token": acc.refresh_token,
                     "total_limit": default_quota,
                     "used_limit": 0,

@@ -1,29 +1,36 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
+import re
+import sqlite3
 import time
 from pathlib import Path
+from typing import Any
 
 import httpx
 import psutil
-from fastapi import FastAPI, Query, HTTPException, Depends
+from fastapi import FastAPI, Query, HTTPException, Depends, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel, Field
 
 from .logging import logger
 
 from .config import BRIDGE_BASE_URL, WARMUP_INIT_RETRIES, WARMUP_INIT_DELAY_S
 from .bridge import initialize_once
 from .router import router
-from .anthropic_router import anthropic_router
+from .anthropic_router import anthropic_router, build_streaming_response_for_account
 from .token_manager import TokenManager
-from .auth import verify_admin_token
+from .auth import verify_admin_token, authenticate_request
+from .anthropic_models import AnthropicMessagesRequest
 
 # 导入账号管理模块
-from warp2protobuf.config.settings import ACCOUNT_DB_PATH, ACCOUNT_ADMIN_ENABLED
+from warp2protobuf.config.settings import (
+    ACCOUNT_DB_PATH,
+    ACCOUNT_ADMIN_ENABLED,
+    ACCOUNT_REGISTER_ENABLED,
+)
 from warp2protobuf.core.account_store import AccountStore
 from warp2protobuf.core.account_selector import AccountSelector
 
@@ -31,8 +38,9 @@ from warp2protobuf.core.account_selector import AccountSelector
 _START_TIME = time.time()
 
 
-app = FastAPI(title="OpenAI Chat Completions (Warp bridge) - Streaming")
-app.include_router(router)
+app = FastAPI(title="Warp Bridge API - Anthropic Messages")
+# OpenAI 兼容层已禁用 —— 如需恢复，取消下行注释
+# app.include_router(router)
 app.include_router(anthropic_router)
 
 # 挂载静态文件（GUI）
@@ -53,10 +61,60 @@ async def serve_gui():
     return FileResponse(index_file)
 
 
+@app.get("/test")
+async def serve_test_page():
+    """Anthropic 请求测试页面"""
+    test_file = STATIC_DIR / "test.html"
+    if not test_file.exists():
+        raise HTTPException(status_code=404, detail="Test page not found")
+    return FileResponse(test_file)
+
+
 # 账号管理 API
 class UpdateLimitRequest(BaseModel):
     total_limit: int
     used_limit: int
+
+
+class UpdateStatusRequest(BaseModel):
+    status: str
+
+
+class AnthropicTestRequest(BaseModel):
+    account_id: int = Field(..., ge=1)
+    model: str = "claude-4-6-opus-high"
+    prompt: str = Field(..., min_length=1)
+    system: str = ""
+    max_tokens: int = Field(1024, ge=1, le=8192)
+
+
+class BatchUpdateStatusRequest(BaseModel):
+    account_ids: list[int]
+    status: str
+
+
+def _fetch_account_tokens(db_path: Path, account_id: int) -> dict[str, Any] | None:
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, email, id_token, refresh_token FROM accounts WHERE id = ?",
+            (account_id,),
+        )
+        row = cursor.fetchone()
+
+    return dict(row) if row else None
+
+
+@app.get("/api/models", dependencies=[Depends(verify_admin_token)])
+async def list_available_models() -> dict[str, Any]:
+    """返回可用模型列表（供测试页下拉选择）。"""
+    from warp2protobuf.config.models import get_all_unique_models
+
+    return {
+        "success": True,
+        "models": get_all_unique_models(),
+    }
 
 
 @app.get("/api/accounts", dependencies=[Depends(verify_admin_token)])
@@ -116,6 +174,50 @@ async def update_account_limit(account_id: int, request: UpdateLimitRequest):
     }
 
 
+@app.patch("/api/accounts/{account_id}/status", dependencies=[Depends(verify_admin_token)])
+async def update_account_status(account_id: int, request: UpdateStatusRequest):
+    """更新单个账号启用/禁用状态"""
+    if not ACCOUNT_ADMIN_ENABLED:
+        raise HTTPException(status_code=403, detail="Account management is disabled")
+
+    if request.status not in ("available", "disabled"):
+        raise HTTPException(status_code=400, detail="status must be 'available' or 'disabled'")
+
+    store = AccountStore(ACCOUNT_DB_PATH)
+    success = store.update_status(account_id, request.status)
+
+    if not success:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    return {
+        "success": True,
+        "account_id": account_id,
+        "status": request.status,
+    }
+
+
+@app.post("/api/accounts/batch-status", dependencies=[Depends(verify_admin_token)])
+async def batch_update_account_status(request: BatchUpdateStatusRequest):
+    """批量更新账号启用/禁用状态"""
+    if not ACCOUNT_ADMIN_ENABLED:
+        raise HTTPException(status_code=403, detail="Account management is disabled")
+
+    if request.status not in ("available", "disabled"):
+        raise HTTPException(status_code=400, detail="status must be 'available' or 'disabled'")
+
+    if not request.account_ids:
+        raise HTTPException(status_code=400, detail="account_ids must not be empty")
+
+    store = AccountStore(ACCOUNT_DB_PATH)
+    updated = store.batch_update_status(request.account_ids, request.status)
+
+    return {
+        "success": True,
+        "updated": updated,
+        "status": request.status,
+    }
+
+
 @app.get("/api/accounts/pool/status", dependencies=[Depends(verify_admin_token)])
 async def get_pool_status():
     """获取账号池实时状态"""
@@ -147,6 +249,30 @@ async def record_account_usage(account_id: int, tokens: int = 0):
         "success": True,
         "message": f"Recorded {tokens} tokens usage",
     }
+
+
+@app.post("/api/test/anthropic/messages", dependencies=[Depends(verify_admin_token)])
+async def test_anthropic_messages(payload: AnthropicTestRequest, request: Request) -> StreamingResponse:
+    """指定账号发送 Anthropic Messages 测试请求（SSE）。"""
+    if not ACCOUNT_ADMIN_ENABLED:
+        raise HTTPException(status_code=403, detail="Account management is disabled")
+
+    await authenticate_request(request)
+
+    req = AnthropicMessagesRequest(
+        model=payload.model,
+        max_tokens=payload.max_tokens,
+        stream=True,
+        system=payload.system,
+        messages=[
+            {
+                "role": "user",
+                "content": payload.prompt,
+            }
+        ],
+    )
+
+    return await build_streaming_response_for_account(req, payload.account_id)
 
 
 @app.get("/api/accounts/current", dependencies=[Depends(verify_admin_token)])
@@ -205,13 +331,88 @@ async def get_account_detail(account_id: int):
     }
 
 
+def _contains_http_status(msg: str, status_code: int) -> bool:
+    patterns = (
+        fr"\bhttp\s+{status_code}\b",
+        fr"\bstatus\s+{status_code}\b",
+    )
+    return any(re.search(pattern, msg) for pattern in patterns)
+
+
+def _is_auth_error(err: Exception) -> bool:
+    msg = str(err).lower()
+    auth_keywords = (
+        "unauthorized",
+        "invalid token",
+        "token invalid",
+        "expired token",
+        "token expired",
+        "unauthenticated",
+        "invalid_grant",
+        "not authenticated",
+    )
+    return any(keyword in msg for keyword in auth_keywords) or _contains_http_status(msg, 401)
+
+
+def _is_transient_error(err: Exception) -> bool:
+    if isinstance(err, (httpx.TimeoutException, httpx.TransportError)):
+        return True
+
+    msg = str(err).lower()
+    transient_keywords = (
+        "timeout",
+        "timed out",
+        "too many requests",
+        "rate limit",
+        "service unavailable",
+        "bad gateway",
+        "gateway timeout",
+        "connection reset",
+        "temporar",
+        "try again",
+    )
+    if any(keyword in msg for keyword in transient_keywords):
+        return True
+
+    return (
+        _contains_http_status(msg, 429)
+        or _contains_http_status(msg, 502)
+        or _contains_http_status(msg, 503)
+    )
+
+
+async def _resolve_quota_with_token_strategy(
+    id_token: str | None,
+    refresh_token: str | None,
+) -> dict[str, Any]:
+    from warp2protobuf.core.auth import refresh_access_token_with_refresh_token, is_token_expired
+    from warp2protobuf.core.quota import get_request_limit_info
+
+    token = ""
+    from_id_token = False
+
+    if id_token and not is_token_expired(id_token, buffer_minutes=0):
+        token = id_token
+        from_id_token = True
+    elif refresh_token:
+        token = await refresh_access_token_with_refresh_token(refresh_token)
+    else:
+        raise RuntimeError("missing valid id_token and refresh_token")
+
+    try:
+        return await get_request_limit_info(token)
+    except Exception as first_error:
+        if from_id_token and refresh_token and _is_auth_error(first_error):
+            refreshed_token = await refresh_access_token_with_refresh_token(refresh_token)
+            return await get_request_limit_info(refreshed_token)
+        raise
+
+
 @app.post("/api/accounts/verify-quota", dependencies=[Depends(verify_admin_token)])
-async def batch_verify_quota():
-    """批量验证所有账号的真实额度（通过 token refresh 检测）"""
+async def batch_verify_quota() -> dict[str, Any]:
+    """批量验证所有账号的真实额度（GraphQL GetRequestLimitInfo）"""
     if not ACCOUNT_ADMIN_ENABLED:
         raise HTTPException(status_code=403, detail="Account management is disabled")
-
-    from warp2protobuf.core.auth import refresh_access_token_with_refresh_token
 
     store = AccountStore(ACCOUNT_DB_PATH)
     accounts, total = store.get_accounts(page=1, page_size=500)
@@ -222,58 +423,61 @@ async def batch_verify_quota():
         account_id = account["id"]
         email = account["email"]
 
-        # 需要完整 token，从数据库直接查
-        import sqlite3
-        with sqlite3.connect(str(store.db_path)) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT refresh_token FROM accounts WHERE id = ?",
-                (account_id,),
-            )
-            row = cursor.fetchone()
+        # 需要完整 token（放到线程中执行，避免阻塞事件循环）
+        row = await asyncio.to_thread(_fetch_account_tokens, store.db_path, account_id)
 
-        if not row or not row["refresh_token"]:
+        if not row:
             results["invalid"] += 1
             results["details"].append({
-                "id": account_id, "email": email,
-                "valid": False, "error": "missing refresh_token",
+                "id": account_id,
+                "email": email,
+                "valid": False,
+                "error": "account not found",
+            })
+            continue
+
+        id_token = row["id_token"]
+        refresh_token = row["refresh_token"]
+
+        if not id_token and not refresh_token:
+            results["invalid"] += 1
+            results["details"].append({
+                "id": account_id,
+                "email": email,
+                "valid": False,
+                "error": "missing id_token and refresh_token",
             })
             continue
 
         try:
-            await refresh_access_token_with_refresh_token(row["refresh_token"])
+            quota_info = await _resolve_quota_with_token_strategy(id_token, refresh_token)
+            total_limit = quota_info["request_limit"]
+            used_limit = quota_info["used"]
+
+            store.update_limit(account_id, total_limit, used_limit)
             results["valid"] += 1
-            # 更新 last_check
-            from datetime import datetime
-            now = datetime.now().isoformat()
-            with sqlite3.connect(str(store.db_path)) as conn:
-                conn.execute(
-                    "UPDATE accounts SET last_check = ?, updated_at = ? WHERE id = ?",
-                    (now, now, account_id),
-                )
-                conn.commit()
             results["details"].append({
-                "id": account_id, "email": email, "valid": True, "error": None,
+                "id": account_id,
+                "email": email,
+                "valid": True,
+                "error": None,
+                "quota": quota_info,
             })
         except Exception as e:
             error_msg = str(e)[:200]
             results["invalid"] += 1
-            # 标记为 disabled
-            from datetime import datetime
-            now = datetime.now().isoformat()
-            with sqlite3.connect(str(store.db_path)) as conn:
-                conn.execute(
-                    "UPDATE accounts SET status = 'disabled', last_check = ?, updated_at = ? WHERE id = ?",
-                    (now, now, account_id),
-                )
-                conn.commit()
+            if _is_auth_error(e):
+                store.update_status(account_id, "disabled")
+            elif _is_transient_error(e):
+                logger.warning("[VerifyQuota] transient error account_id=%s: %s", account_id, error_msg)
             results["details"].append({
-                "id": account_id, "email": email,
-                "valid": False, "error": error_msg,
+                "id": account_id,
+                "email": email,
+                "valid": False,
+                "error": error_msg,
             })
 
-        # 避免请求过快被 Firebase 限流
+        # 避免请求过快被限流
         await asyncio.sleep(1.5)
 
     logger.info(
@@ -284,63 +488,57 @@ async def batch_verify_quota():
 
 
 @app.post("/api/accounts/{account_id}/verify-quota", dependencies=[Depends(verify_admin_token)])
-async def verify_single_quota(account_id: int):
-    """验证单个账号的真实额度（通过 token refresh 检测）"""
+async def verify_single_quota(account_id: int) -> dict[str, Any]:
+    """验证单个账号的真实额度（GraphQL GetRequestLimitInfo）"""
     if not ACCOUNT_ADMIN_ENABLED:
         raise HTTPException(status_code=403, detail="Account management is disabled")
 
-    from warp2protobuf.core.auth import refresh_access_token_with_refresh_token
-    import sqlite3
-
     store = AccountStore(ACCOUNT_DB_PATH)
 
-    # 获取完整 token
-    with sqlite3.connect(str(store.db_path)) as conn:
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT id, email, refresh_token FROM accounts WHERE id = ?",
-            (account_id,),
-        )
-        row = cursor.fetchone()
+    # 获取完整 token（放到线程中执行，避免阻塞事件循环）
+    row = await asyncio.to_thread(_fetch_account_tokens, store.db_path, account_id)
 
     if not row:
         raise HTTPException(status_code=404, detail="Account not found")
 
     email = row["email"]
+    id_token = row["id_token"]
     refresh_token = row["refresh_token"]
 
-    if not refresh_token:
+    if not id_token and not refresh_token:
         return {
             "success": True,
-            "result": {"id": account_id, "email": email, "valid": False, "error": "missing refresh_token"},
+            "result": {
+                "id": account_id,
+                "email": email,
+                "valid": False,
+                "error": "missing id_token and refresh_token",
+            },
         }
 
     try:
-        await refresh_access_token_with_refresh_token(refresh_token)
-        # 更新 last_check
-        from datetime import datetime
-        now = datetime.now().isoformat()
-        with sqlite3.connect(str(store.db_path)) as conn:
-            conn.execute(
-                "UPDATE accounts SET last_check = ?, updated_at = ? WHERE id = ?",
-                (now, now, account_id),
-            )
-            conn.commit()
+        quota_info = await _resolve_quota_with_token_strategy(id_token, refresh_token)
+        total_limit = quota_info["request_limit"]
+        used_limit = quota_info["used"]
+
+        store.update_limit(account_id, total_limit, used_limit)
+
         return {
             "success": True,
-            "result": {"id": account_id, "email": email, "valid": True, "error": None},
+            "result": {
+                "id": account_id,
+                "email": email,
+                "valid": True,
+                "error": None,
+                "quota": quota_info,
+            },
         }
     except Exception as e:
         error_msg = str(e)[:200]
-        from datetime import datetime
-        now = datetime.now().isoformat()
-        with sqlite3.connect(str(store.db_path)) as conn:
-            conn.execute(
-                "UPDATE accounts SET status = 'disabled', last_check = ?, updated_at = ? WHERE id = ?",
-                (now, now, account_id),
-            )
-            conn.commit()
+        if _is_auth_error(e):
+            store.update_status(account_id, "disabled")
+        elif _is_transient_error(e):
+            logger.warning("[VerifyQuota] transient error account_id=%s: %s", account_id, error_msg)
         return {
             "success": True,
             "result": {"id": account_id, "email": email, "valid": False, "error": error_msg},
@@ -353,11 +551,34 @@ class RegisterRequest(BaseModel):
     default_quota: int = 300
 
 
+class FeatureFlagsResponse(BaseModel):
+    account_admin_enabled: bool
+    account_register_enabled: bool
+
+
+@app.get("/api/config", dependencies=[Depends(verify_admin_token)])
+async def get_feature_flags() -> dict[str, Any]:
+    """返回前端可见的功能开关状态。"""
+    return {
+        "success": True,
+        "features": FeatureFlagsResponse(
+            account_admin_enabled=ACCOUNT_ADMIN_ENABLED,
+            account_register_enabled=ACCOUNT_REGISTER_ENABLED,
+        ).model_dump(),
+    }
+
+
 @app.post("/api/accounts/register", dependencies=[Depends(verify_admin_token)])
-async def register_accounts(request: RegisterRequest):
+async def register_accounts(request: RegisterRequest) -> dict[str, Any]:
     """批量注册新 Warp 账号（Firebase email/password signUp）并自动入库"""
     if not ACCOUNT_ADMIN_ENABLED:
         raise HTTPException(status_code=403, detail="Account management is disabled")
+
+    if not ACCOUNT_REGISTER_ENABLED:
+        raise HTTPException(
+            status_code=403,
+            detail="Account registration is temporarily disabled",
+        )
 
     if request.count < 1 or request.count > 50:
         raise HTTPException(status_code=400, detail="count must be 1-50")
@@ -425,8 +646,8 @@ async def manual_token_refresh():
     }
 
 
-@app.get("/api/system/stats")
-async def get_system_stats():
+@app.get("/api/system/stats", dependencies=[Depends(verify_admin_token)])
+async def get_system_stats() -> dict[str, Any]:
     """获取系统监控信息"""
     try:
         process = psutil.Process(os.getpid())
@@ -469,17 +690,18 @@ async def get_system_stats():
             }
         }
     except Exception as e:
+        logger.exception("[SystemStats] failed to collect system stats")
         return {
             "success": False,
-            "error": str(e)
+            "error": "failed to collect system stats"
         }
 
 
 @app.on_event("startup")
 async def _on_startup():
     try:
-        logger.info("[OpenAI Compat] Server starting. BRIDGE_BASE_URL=%s", BRIDGE_BASE_URL)
-        logger.info("[OpenAI Compat] Endpoints: GET /healthz, GET /v1/models, POST /v1/chat/completions")
+        logger.info("[Warp Bridge] Server starting. BRIDGE_BASE_URL=%s", BRIDGE_BASE_URL)
+        logger.info("[Warp Bridge] Endpoints: POST /v1/messages (Anthropic), /api/* (管理), /gui")
     except Exception:
         pass
 
@@ -491,24 +713,24 @@ async def _on_startup():
             async with httpx.AsyncClient(timeout=5.0, trust_env=True) as client:
                 resp = await client.get(url)
             if resp.status_code == 200:
-                logger.info("[OpenAI Compat] Bridge server is ready at %s", url)
+                logger.info("[Warp Bridge] Bridge server is ready at %s", url)
                 break
             else:
-                logger.warning("[OpenAI Compat] Bridge health at %s -> HTTP %s", url, resp.status_code)
+                logger.warning("[Warp Bridge] Bridge health at %s -> HTTP %s", url, resp.status_code)
         except Exception as e:
-            logger.warning("[OpenAI Compat] Bridge health attempt %s/%s failed: %s", attempt, retries, e)
+            logger.warning("[Warp Bridge] Bridge health attempt %s/%s failed: %s", attempt, retries, e)
         await asyncio.sleep(delay_s)
     else:
-        logger.error("[OpenAI Compat] Bridge server not ready at %s", url)
+        logger.error("[Warp Bridge] Bridge server not ready at %s", url)
 
     try:
         await asyncio.to_thread(initialize_once)
     except Exception as e:
-        logger.warning(f"[OpenAI Compat] Warmup initialize_once on startup failed: {e}")
+        logger.warning("[Warp Bridge] Warmup initialize_once on startup failed: %s", e)
 
     # 批量 Token 刷新已改为手动触发（POST /api/tokens/refresh）
     # 不再启动时自动刷新，避免 Firebase 限流
-    logger.info("[OpenAI Compat] Token 批量刷新已关闭自动启动，如需刷新请调用 POST /api/tokens/refresh")
+    logger.info("[Warp Bridge] Token 批量刷新已关闭自动启动，如需刷新请调用 POST /api/tokens/refresh")
 
     # 启动后台预刷新：每 5 分钟检查即将过期的 token，提前 10 分钟刷新
     # 这是轻量级的，只刷新快到期的，不会一次性刷新所有账号

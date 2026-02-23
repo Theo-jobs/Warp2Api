@@ -26,7 +26,10 @@ from .auth import authenticate_request
 from .token_manager import TokenManager
 
 from warp2protobuf.config.models import resolve_model, get_all_unique_models as _get_all_models
-from warp2protobuf.config.settings import ACCOUNT_DB_PATH
+from warp2protobuf.config.settings import (
+    ACCOUNT_DB_PATH,
+    HISTORY_TOOL_RESULT_MAX_CHARS,
+)
 from warp2protobuf.core.account_context import AccountContext, get_current_account_info
 
 router = APIRouter()
@@ -87,7 +90,10 @@ def _serialize_history_to_text(history: List[ChatMessage]) -> Optional[str]:
                 tc_args = fn.get("arguments", "{}")
                 lines.append(f"Assistant: [called tool: {tc_name}({tc_args})]")
         elif m.role == "tool":
-            lines.append(f"Tool result ({m.tool_call_id or 'unknown'}): {text[:500]}")
+            max_chars = max(1, HISTORY_TOOL_RESULT_MAX_CHARS)
+            lines.append(
+                f"Tool result ({m.tool_call_id or 'unknown'}): {text[:max_chars]}"
+            )
     if not lines:
         return None
     return (

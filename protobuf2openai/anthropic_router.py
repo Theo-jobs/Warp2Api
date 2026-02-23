@@ -10,12 +10,17 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sqlite3
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-from warp2protobuf.config.settings import ACCOUNT_DB_PATH
+from warp2protobuf.config.settings import (
+    ACCOUNT_DB_PATH,
+    HISTORY_TOOL_RESULT_MAX_CHARS,
+)
 from warp2protobuf.core.account_selector import AccountSelector
 from warp2protobuf.config.models import resolve_model
 
@@ -27,6 +32,25 @@ from .helpers import normalize_content_to_list, segments_to_text
 from .models import ChatMessage
 from .packets import attach_user_and_tools_to_inputs, packet_template
 from .token_manager import TokenManager
+
+
+def _get_account_by_id_with_tokens(db_path: str, account_id: int) -> dict[str, Any] | None:
+    """按账号 ID 获取完整账号信息（含 id_token/refresh_token）。"""
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT
+                id, email, local_id, id_token, refresh_token, api_key,
+                status, total_limit, used_limit, use_count, last_used
+            FROM accounts
+            WHERE id = ?
+            """,
+            (account_id,),
+        )
+        row = cursor.fetchone()
+    return dict(row) if row else None
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +82,26 @@ def _extract_system_prompt(req: AnthropicMessagesRequest) -> str | None:
     return None
 
 
+def _tool_result_content_to_text(inner: Any) -> str:
+    """Serialize tool_result content without dropping structured blocks."""
+    if isinstance(inner, str):
+        return inner
+
+    if isinstance(inner, list):
+        normalized_inner: list[dict[str, Any]] = []
+        for sub in inner:
+            if isinstance(sub, dict):
+                normalized_inner.append(sub)
+            elif isinstance(sub, str):
+                normalized_inner.append({"type": "text", "text": sub})
+        return segments_to_text(normalized_inner)
+
+    if isinstance(inner, dict):
+        return segments_to_text(normalize_content_to_list(inner))
+
+    return str(inner)
+
+
 def _serialize_content_blocks(content: Any) -> str:
     """Serialize Anthropic content blocks to a plain-text string for Warp."""
     if isinstance(content, str):
@@ -75,16 +119,7 @@ def _serialize_content_blocks(content: Any) -> str:
                     # Encode tool_use as a JSON string so Warp can parse it
                     parts.append(json.dumps(block, ensure_ascii=False))
                 elif btype == "tool_result":
-                    # Flatten tool_result content
-                    inner = block.get("content", "")
-                    if isinstance(inner, list):
-                        for sub in inner:
-                            if isinstance(sub, dict) and sub.get("type") == "text":
-                                parts.append(sub.get("text", ""))
-                            elif isinstance(sub, str):
-                                parts.append(sub)
-                    elif isinstance(inner, str):
-                        parts.append(inner)
+                    parts.append(_tool_result_content_to_text(block.get("content", "")))
                 elif btype == "image":
                     parts.append("[image]")
                 else:
@@ -110,16 +145,8 @@ def _find_last_tool_results(messages: list[dict[str, Any]]) -> list[dict[str, An
     for block in content:
         if isinstance(block, dict) and block.get("type") == "tool_result":
             tool_use_id = block.get("tool_use_id", "")
-            inner = block.get("content", "")
-            if isinstance(inner, list):
-                text_parts = []
-                for sub in inner:
-                    if isinstance(sub, dict) and sub.get("type") == "text":
-                        text_parts.append(sub.get("text", ""))
-                    elif isinstance(sub, str):
-                        text_parts.append(sub)
-                inner = "\n".join(text_parts)
-            results.append({"tool_use_id": tool_use_id, "content": str(inner)})
+            inner = _tool_result_content_to_text(block.get("content", ""))
+            results.append({"tool_use_id": tool_use_id, "content": inner})
     return results
 
 
@@ -195,19 +222,11 @@ def _build_warp_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
 
                 # Emit tool results as OpenAI-style "tool" messages
                 for tr in tool_results:
-                    inner = tr.get("content", "")
-                    if isinstance(inner, list):
-                        serialized_parts = []
-                        for sub in inner:
-                            if isinstance(sub, dict) and sub.get("type") == "text":
-                                serialized_parts.append(sub.get("text", ""))
-                            elif isinstance(sub, str):
-                                serialized_parts.append(sub)
-                        inner = "\n".join(serialized_parts)
+                    inner = _tool_result_content_to_text(tr.get("content", ""))
                     warp_msgs.append({
                         "role": "tool",
                         "tool_call_id": tr.get("tool_use_id", ""),
-                        "content": str(inner),
+                        "content": inner,
                     })
 
                 # Also emit any remaining text as a user message
@@ -285,7 +304,10 @@ def _serialize_history_to_text(history: list[ChatMessage]) -> str | None:
                 tc_args = fn.get("arguments", "{}")
                 lines.append(f"Assistant: [called tool: {tc_name}({tc_args})]")
         elif m.role == "tool":
-            lines.append(f"Tool result ({m.tool_call_id or 'unknown'}): {text[:500]}")
+            max_chars = max(1, HISTORY_TOOL_RESULT_MAX_CHARS)
+            lines.append(
+                f"Tool result ({m.tool_call_id or 'unknown'}): {text[:max_chars]}"
+            )
 
     if not lines:
         return None
@@ -382,8 +404,8 @@ async def anthropic_messages(request: Request) -> StreamingResponse:
     # --- Build packet (mirrors router.py pattern) ---
     packet = packet_template()
 
-    # Stateless mode
-    packet["task_context"] = {}
+    # Stateless mode — 每次请求生成新的 task_id，避免 Warp 400 "conversation" 错误
+    packet["task_context"] = {"active_task_id": str(uuid.uuid4())}
 
     # Set model (key is "base", not "base_model")
     packet["settings"]["model_config"]["base"] = warp_model
@@ -439,6 +461,114 @@ async def anthropic_messages(request: Request) -> StreamingResponse:
             selector.record_usage(account_id, 1)
         except Exception as exc:
             logger.error("[Anthropic] stream error: %s", exc)
+            raise
+
+    return StreamingResponse(
+        _stream_with_usage(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+async def build_streaming_response_for_account(
+    req: AnthropicMessagesRequest,
+    account_id: int,
+) -> StreamingResponse:
+    """使用指定账号构建 Anthropic SSE 流响应。"""
+    selector = AccountSelector(ACCOUNT_DB_PATH)
+    token_mgr = TokenManager.get_instance(ACCOUNT_DB_PATH)
+
+    account = _get_account_by_id_with_tokens(ACCOUNT_DB_PATH, account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail=f"Account #{account_id} not found")
+
+    if account.get("status") != "available":
+        raise HTTPException(status_code=400, detail=f"Account #{account_id} is not available")
+
+    access_token = await token_mgr.get_valid_token(account)
+    if not access_token:
+        raise HTTPException(status_code=503, detail=f"Account #{account_id} has no valid token")
+
+    async with token_mgr.env_lock:
+        os.environ["WARP_JWT"] = access_token
+
+    try:
+        initialize_once()
+    except Exception as e:
+        logger.warning("[AnthropicTest] initialize_once failed or skipped: %s", e)
+
+    warp_model = resolve_model(req.model)
+    logger.info(
+        "[AnthropicTest] account_id=%d model='%s' → warp='%s'",
+        account_id,
+        req.model,
+        warp_model,
+    )
+
+    raw_messages = [m if isinstance(m, dict) else m.model_dump() for m in req.messages]
+    warp_messages = _build_warp_messages(raw_messages)
+
+    final_system = _extract_system_prompt(req)
+
+    raw_tools = None
+    if req.tools:
+        raw_tools = [t if isinstance(t, dict) else t.model_dump() for t in req.tools]
+    openai_tools = _convert_tools_to_openai(raw_tools)
+
+    packet = packet_template()
+    packet["task_context"] = {"active_task_id": str(uuid.uuid4())}
+    packet["settings"]["model_config"]["base"] = warp_model
+
+    chat_messages: list[ChatMessage] = []
+    for msg in warp_messages:
+        chat_messages.append(ChatMessage(
+            role=msg["role"],
+            content=msg.get("content", ""),
+            tool_call_id=msg.get("tool_call_id"),
+            tool_calls=msg.get("tool_calls"),
+            name=msg.get("name"),
+        ))
+
+    history_text = _serialize_history_to_text(chat_messages)
+    if history_text:
+        if final_system:
+            final_system = final_system + "\n\n" + history_text
+        else:
+            final_system = history_text
+
+    attach_user_and_tools_to_inputs(packet, chat_messages, final_system)
+
+    if openai_tools:
+        mcp_tools: list[dict[str, Any]] = []
+        for t in openai_tools:
+            func = t.get("function", {})
+            mcp_tools.append({
+                "name": func.get("name", ""),
+                "description": func.get("description", ""),
+                "input_schema": func.get("parameters", {}),
+            })
+        if mcp_tools:
+            packet.setdefault("mcp_context", {}).setdefault("tools", []).extend(mcp_tools)
+
+    logger.info(
+        "[AnthropicTest] request: account_id=%d model=%s messages=%d tools=%d",
+        account_id,
+        req.model,
+        len(chat_messages),
+        len(openai_tools),
+    )
+
+    async def _stream_with_usage() -> Any:
+        try:
+            async for chunk in stream_anthropic_sse(packet, model=req.model, access_token=access_token):
+                yield chunk
+            selector.record_usage(account_id, 1)
+        except Exception as exc:
+            logger.error("[AnthropicTest] stream error account_id=%d: %s", account_id, exc)
             raise
 
     return StreamingResponse(

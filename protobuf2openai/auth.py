@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import os
 from typing import Optional
 from fastapi import HTTPException, Request, status
@@ -47,7 +48,7 @@ class BearerTokenAuth:
             return False
 
         token = authorization[7:]  # 移除 "Bearer " 前缀
-        return token == self.expected_token
+        return hmac.compare_digest(token, self.expected_token)
 
     def get_auth_error_response(self) -> JSONResponse:
         """获取认证失败的响应"""

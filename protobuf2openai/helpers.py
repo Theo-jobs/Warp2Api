@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import ipaddress
+import json
 import re
 import socket
 from typing import Any, Dict, List, Optional, Tuple
@@ -191,12 +192,56 @@ def extract_images_from_segments(segments: List[Dict[str, Any]]) -> List[Dict[st
     return images
 
 
+def _stringify_segment(seg: Dict[str, Any]) -> str:
+    """Serialize a segment to text while avoiding oversized binary payloads."""
+    if not isinstance(seg, dict):
+        return ""
+
+    seg_type = seg.get("type")
+    if seg_type == "text" and isinstance(seg.get("text"), str):
+        return seg.get("text") or ""
+
+    if seg_type == "image":
+        source = seg.get("source") if isinstance(seg.get("source"), dict) else {}
+        media_type = source.get("media_type") if isinstance(source.get("media_type"), str) else "unknown"
+        return f"[image:{media_type}]"
+
+    if seg_type == "image_url":
+        return "[image_url]"
+
+    # Keep structured tool output (e.g. json) as compact JSON string.
+    try:
+        return json.dumps(seg, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        return str(seg)
+
+
 def segments_to_text(segments: List[Dict[str, Any]]) -> str:
-    parts: List[str] = []
+    text_parts: List[str] = []
+    structured_parts: List[str] = []
+
     for seg in segments:
-        if isinstance(seg, dict) and seg.get("type") == "text" and isinstance(seg.get("text"), str):
-            parts.append(seg.get("text") or "")
-    return "".join(parts)
+        if not isinstance(seg, dict):
+            continue
+
+        if seg.get("type") == "text" and isinstance(seg.get("text"), str):
+            text_parts.append(seg.get("text") or "")
+            continue
+
+        serialized = _stringify_segment(seg)
+        if serialized:
+            structured_parts.append(serialized)
+
+    # Keep legacy behavior for pure text content.
+    if not structured_parts:
+        return "".join(text_parts)
+
+    merged: List[str] = []
+    text_block = "".join(text_parts)
+    if text_block:
+        merged.append(text_block)
+    merged.extend(structured_parts)
+    return "\n".join(merged)
 
 
 def segments_to_warp_results(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

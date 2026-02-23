@@ -20,6 +20,16 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() not in ("0", "false", "no", "off", "")
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw.strip())
+    except (TypeError, ValueError):
+        return default
+
+
 # Path configurations
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent.parent.parent
 PROTO_DIR = SCRIPT_DIR / "proto"
@@ -66,6 +76,50 @@ ACCOUNT_POOL_RELEASE_TIMEOUT = float(os.getenv("ACCOUNT_POOL_RELEASE_TIMEOUT", "
 ACCOUNT_POOL_SWITCH_MAX_RETRIES = int(os.getenv("ACCOUNT_POOL_SWITCH_MAX_RETRIES", "2"))
 ACCOUNT_POOL_FALLBACK_TO_ENV = _env_bool("ACCOUNT_POOL_FALLBACK_TO_ENV", True)
 
+# HTTP proxy for external requests (registration, token refresh, etc.)
+# Set to "" or "none" to disable. Example: "http://127.0.0.1:7890"
+_raw_proxy = os.getenv("WARP_PROXY_URL", "")
+PROXY_URL: str | None = _raw_proxy if _raw_proxy and _raw_proxy.lower() != "none" else None
+
+# Domains that must bypass HTTP proxy (MITM proxies like Stash can't handle their TLS)
+# Comma-separated, e.g. "warp.dev,googleapis.com"
+# Set to empty string if Stash has been configured with DIRECT rules for these domains
+_raw_no_proxy = os.getenv("WARP_NO_PROXY_DOMAINS", "")
+NO_PROXY_DOMAINS: tuple[str, ...] = tuple(
+    d.strip() for d in _raw_no_proxy.split(",") if d.strip()
+)
+
+
+def proxy_for_url(url: str) -> str | None:
+    """Return PROXY_URL unless the URL's domain is in the no-proxy list or is local."""
+    if not PROXY_URL:
+        return None
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).hostname or ""
+        # 本地地址不走代理
+        if host in ("localhost", "127.0.0.1", "::1") or host.startswith("192.168.") or host.startswith("10."):
+            return None
+        for domain in NO_PROXY_DOMAINS:
+            if host == domain or host.endswith(f".{domain}"):
+                return None
+    except Exception:
+        pass
+    return PROXY_URL
+
+
+# TLS verification — disable when using MITM proxies (Stash/Surge/mitmproxy)
+# Set WARP_INSECURE_TLS=1 to skip certificate verification
+TLS_VERIFY: bool = not _env_bool("WARP_INSECURE_TLS", False)
+
 # Account database configuration
 ACCOUNT_DB_PATH = os.getenv("ACCOUNT_DB_PATH", str(SCRIPT_DIR / "accounts.db"))
 ACCOUNT_ADMIN_ENABLED = _env_bool("ACCOUNT_ADMIN_ENABLED", True)
+ACCOUNT_REGISTER_ENABLED = _env_bool("ACCOUNT_REGISTER_ENABLED", False)
+
+# History serialization truncation length for tool results
+# Used by protobuf2openai routers when converting conversation history into system text.
+HISTORY_TOOL_RESULT_MAX_CHARS = min(
+    100_000,
+    max(1, _env_int("HISTORY_TOOL_RESULT_MAX_CHARS", 100_000)),
+)

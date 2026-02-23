@@ -22,6 +22,9 @@ from ..config.settings import (
     OS_CATEGORY,
     OS_NAME,
     OS_VERSION,
+    PROXY_URL,
+    TLS_VERIFY,
+    proxy_for_url,
 )
 from .logging import logger, log
 
@@ -57,7 +60,12 @@ async def refresh_access_token_with_refresh_token(refresh_token: str) -> str:
     payload = f"grant_type=refresh_token&refresh_token={refresh_token}".encode("utf-8")
     headers = _build_refresh_headers(len(payload))
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+    client_kwargs: dict = {"timeout": httpx.Timeout(30.0), "verify": TLS_VERIFY, "trust_env": False}
+    _proxy = proxy_for_url(REFRESH_URL)
+    if _proxy:
+        client_kwargs["proxy"] = _proxy
+
+    async with httpx.AsyncClient(**client_kwargs) as client:
         response = await client.post(REFRESH_URL, headers=headers, content=payload)
 
     if response.status_code != 200:
@@ -141,7 +149,11 @@ async def refresh_jwt_token() -> dict:
     try:
         payload = base64.b64decode(REFRESH_TOKEN_B64)
         headers = _build_refresh_headers(len(payload))
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        client_kwargs: dict = {"timeout": 30.0, "verify": TLS_VERIFY, "trust_env": False}
+        _proxy = proxy_for_url(REFRESH_URL)
+        if _proxy:
+            client_kwargs["proxy"] = _proxy
+        async with httpx.AsyncClient(**client_kwargs) as client:
             response = await client.post(
                 REFRESH_URL,
                 headers=headers,
@@ -319,7 +331,7 @@ async def _create_anonymous_user() -> dict:
         }
     }
     body = {"query": query, "variables": variables, "operationName": "CreateAnonymousUser"}
-    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0), proxy=proxy_for_url(_ANON_GQL_URL), verify=TLS_VERIFY, trust_env=False) as client:
         resp = await client.post(_ANON_GQL_URL, headers=headers, json=body)
         if resp.status_code != 200:
             raise RuntimeError(f"CreateAnonymousUser failed: HTTP {resp.status_code} {resp.text[:200]}")
@@ -343,7 +355,7 @@ async def _exchange_id_token_for_refresh_token(id_token: str) -> dict:
         "returnSecureToken": "true",
         "token": id_token,
     }
-    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0), proxy=proxy_for_url(url), verify=TLS_VERIFY, trust_env=False) as client:
         resp = await client.post(url, headers=headers, data=form)
         if resp.status_code != 200:
             raise RuntimeError(f"signInWithCustomToken failed: HTTP {resp.status_code} {resp.text[:200]}")
@@ -376,7 +388,11 @@ async def acquire_anonymous_access_token() -> str:
     # Now call Warp proxy token endpoint to get access_token using this refresh token
     payload = f"grant_type=refresh_token&refresh_token={refresh_token}".encode("utf-8")
     headers = _build_refresh_headers(len(payload))
-    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+    client_kwargs2: dict = {"timeout": httpx.Timeout(30.0), "verify": TLS_VERIFY, "trust_env": False}
+    _proxy2 = proxy_for_url(REFRESH_URL)
+    if _proxy2:
+        client_kwargs2["proxy"] = _proxy2
+    async with httpx.AsyncClient(**client_kwargs2) as client:
         resp = await client.post(REFRESH_URL, headers=headers, content=payload)
         if resp.status_code != 200:
             raise RuntimeError(

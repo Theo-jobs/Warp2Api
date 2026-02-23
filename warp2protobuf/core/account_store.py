@@ -250,3 +250,37 @@ class AccountStore:
 
             conn.commit()
             return cursor.rowcount > 0
+
+    def update_status(self, account_id: int, status: str) -> bool:
+        """更新单个账号状态（仅允许 available / disabled）"""
+        if status not in ("available", "disabled"):
+            raise ValueError(f"Invalid status: {status!r}, must be 'available' or 'disabled'")
+
+        with sqlite3.connect(str(self.db_path)) as conn:
+            cursor = conn.cursor()
+            now = datetime.now().isoformat()
+            cursor.execute(
+                "UPDATE accounts SET status = ?, updated_at = ? WHERE id = ?",
+                (status, now, account_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def batch_update_status(self, account_ids: list[int], status: str) -> int:
+        """批量更新账号状态，返回实际更新数量"""
+        if status not in ("available", "disabled"):
+            raise ValueError(f"Invalid status: {status!r}, must be 'available' or 'disabled'")
+
+        if not account_ids:
+            return 0
+
+        with sqlite3.connect(str(self.db_path)) as conn:
+            cursor = conn.cursor()
+            now = datetime.now().isoformat()
+            placeholders = ",".join("?" for _ in account_ids)
+            cursor.execute(
+                f"UPDATE accounts SET status = ?, updated_at = ? WHERE id IN ({placeholders})",
+                [status, now] + list(account_ids),
+            )
+            conn.commit()
+            return cursor.rowcount

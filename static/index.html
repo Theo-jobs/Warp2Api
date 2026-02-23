@@ -85,7 +85,6 @@
             font-weight: 500;
         }
         .status-available { background: #d4edda; color: #155724; }
-        .status-in_use { background: #fff3cd; color: #856404; }
         .status-disabled { background: #f8d7da; color: #721c24; }
 
         .pagination {
@@ -108,6 +107,9 @@
         }
 
         .loading { text-align: center; padding: 40px; color: #666; }
+        .compact-card { padding: 12px 14px; }
+        .compact-title { margin: 0 0 8px 0; color: #333; font-size: 16px; font-weight: 600; }
+        .compact-content { font-size: 13px; color: #666; line-height: 1.4; }
         .error { background: #f8d7da; color: #721c24; padding: 15px; border-radius: 4px; margin-bottom: 20px; }
         .success-msg { background: #d4edda; color: #155724; padding: 15px; border-radius: 4px; margin-bottom: 20px; }
         .btn-warning { background: #ffc107; color: #333; }
@@ -129,6 +131,116 @@
         .btn-success:hover { background: #218838; }
         .btn-secondary { background: #6c757d; }
         .btn-secondary:hover { background: #5a6268; }
+        .btn-enable { background: #28a745; }
+        .btn-enable:hover { background: #218838; }
+        .btn-disable { background: #dc3545; }
+        .btn-disable:hover { background: #c82333; }
+
+        .batch-bar {
+            display: none;
+            background: white;
+            padding: 12px 15px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-top: 15px;
+            align-items: center;
+            gap: 12px;
+        }
+        .batch-bar.visible { display: flex; }
+        .batch-bar .selected-count { font-size: 14px; color: #333; font-weight: 600; }
+
+        th input[type="checkbox"], td input[type="checkbox"] {
+            width: 16px; height: 16px; cursor: pointer;
+        }
+
+        /* 额度进度条 */
+        .quota-cell { min-width: 180px; }
+        .quota-bar-wrap {
+            height: 6px;
+            background: #e9ecef;
+            border-radius: 3px;
+            overflow: hidden;
+            margin-top: 4px;
+        }
+        .quota-bar-inner {
+            height: 100%;
+            border-radius: 3px;
+            transition: width 0.3s;
+        }
+        .quota-bar-green { background: #28a745; }
+        .quota-bar-orange { background: #fd7e14; }
+        .quota-bar-red { background: #dc3545; }
+        .quota-bar-gray { background: #adb5bd; }
+        .quota-text { font-size: 13px; font-weight: 500; }
+        .quota-text.green { color: #28a745; }
+        .quota-text.orange { color: #fd7e14; }
+        .quota-text.red { color: #dc3545; }
+        .quota-text.gray { color: #adb5bd; }
+        .quota-sub { font-size: 11px; color: #999; margin-top: 2px; }
+        .quota-unlimited { font-size: 14px; font-weight: 600; color: #007bff; }
+
+        /* 刷新额度小按钮 */
+        .btn-refresh-quota {
+            padding: 2px 6px;
+            font-size: 11px;
+            background: #17a2b8;
+            color: white;
+            border: none;
+            border-radius: 3px;
+            cursor: pointer;
+            margin-left: 4px;
+            vertical-align: middle;
+        }
+        .btn-refresh-quota:hover { background: #138496; }
+        .btn-refresh-quota:disabled { background: #ccc; cursor: not-allowed; }
+        .btn-refresh-quota.spinning { animation: spin 1s linear infinite; }
+        @keyframes spin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+
+        /* 批量刷新额度按钮 */
+        .btn-info { background: #17a2b8; color: white; }
+        .btn-info:hover { background: #138496; }
+
+        .quota-disabled {
+            color: #9ca3af;
+            font-style: italic;
+        }
+        .quota-next-refresh {
+            font-size: 11px;
+            color: #9ca3af;
+            margin-top: 4px;
+        }
+
+        .api-call-sticky {
+            position: sticky;
+            top: 10px;
+            z-index: 90;
+            margin-bottom: 20px;
+            border-left: 4px solid #6c757d;
+            transition: border-color 0.2s ease, box-shadow 0.2s ease;
+        }
+        .api-call-sticky .api-call-text {
+            margin-top: 10px;
+            font-size: 13px;
+            color: #666;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+            word-break: break-word;
+            line-height: 1.4;
+        }
+        .api-call-sticky.is-pending {
+            border-left-color: #fd7e14;
+            box-shadow: 0 2px 8px rgba(253, 126, 20, 0.18);
+        }
+        .api-call-sticky.is-success {
+            border-left-color: #28a745;
+            box-shadow: 0 2px 8px rgba(40, 167, 69, 0.14);
+        }
+        .api-call-sticky.is-error {
+            border-left-color: #dc3545;
+            box-shadow: 0 2px 8px rgba(220, 53, 69, 0.16);
+        }
     </style>
 </head>
 <body>
@@ -136,6 +248,7 @@
         <h1>📊 Warp2Api 账号管理</h1>
 
         <div id="error" class="error" style="display: none;"></div>
+        <div id="success" class="success-msg" style="display: none;"></div>
 
         <div class="summary-cards">
             <div class="card">
@@ -175,13 +288,18 @@
             <select id="status">
                 <option value="">全部状态</option>
                 <option value="available">可用</option>
-                <option value="in_use">使用中</option>
                 <option value="disabled">已禁用</option>
             </select>
             <button onclick="loadAccounts()">🔍 搜索</button>
             <button onclick="loadSummary()">🔄 刷新</button>
-            <button onclick="batchVerifyQuota()" class="btn-warning" id="btn-verify">🔍 检查全部额度</button>
-            <button onclick="showRegisterModal()" class="btn-success" id="btn-register">➕ 注册新账号</button>
+            <button onclick="batchRefreshQuota()" class="btn-warning" id="btn-verify">🔍 批量检查额度</button>
+            <button onclick="window.open('/test', '_blank')" class="btn-success" id="btn-anthropic-test">🧪 Anthropic 测试页</button>
+            <button onclick="showRegisterModal()" class="btn-secondary" id="btn-register" disabled title="自动注册功能已暂缓">➕ 注册新账号（已暂缓）</button>
+        </div>
+
+        <div class="card api-call-sticky" id="api-call-card">
+            <div class="card-title">最近接口调用（置顶）</div>
+            <div id="api-call-info" class="api-call-text">-</div>
         </div>
 
         <div class="verify-progress" id="verify-progress">
@@ -195,22 +313,10 @@
 
         <div id="loading" class="loading">加载中...</div>
 
-        <div style="margin-bottom: 30px;">
-            <h2 style="color: #333; margin-bottom: 15px; font-size: 18px;">最近使用记录</h2>
-            <table id="recent-table" style="display: none;">
-                <thead>
-                    <tr>
-                        <th>邮箱</th>
-                        <th>Local ID</th>
-                        <th>状态</th>
-                        <th>剩余额度</th>
-                        <th>使用次数</th>
-                        <th>最后使用</th>
-                    </tr>
-                </thead>
-                <tbody id="recent-body"></tbody>
-            </table>
-            <div id="recent-loading" class="loading" style="display: none;">加载最近使用记录...</div>
+        <div class="card compact-card" style="margin-bottom: 20px;">
+            <h2 class="compact-title">最近使用记录</h2>
+            <div id="recent-loading" class="compact-content" style="display: none;">加载最近使用记录...</div>
+            <div id="recent-list" class="compact-content" style="display: none;"></div>
         </div>
 
         <h2 style="color: #333; margin-bottom: 15px; font-size: 18px;">所有账号</h2>
@@ -218,13 +324,12 @@
         <table id="accounts-table" style="display: none;">
             <thead>
                 <tr>
+                    <th><input type="checkbox" id="select-all" onclick="toggleSelectAll(this)"></th>
                     <th>ID</th>
                     <th>邮箱</th>
                     <th>Local ID</th>
                     <th>状态</th>
-                    <th>总额度</th>
-                    <th>已用</th>
-                    <th>剩余</th>
+                    <th>额度</th>
                     <th>使用次数</th>
                     <th>最后检查</th>
                     <th>操作</th>
@@ -234,6 +339,12 @@
         </table>
 
         <div class="pagination" id="pagination" style="display: none;"></div>
+
+        <div class="batch-bar" id="batch-bar">
+            <span class="selected-count" id="selected-count">已选 0 个</span>
+            <button class="btn-enable btn-sm" onclick="batchUpdateStatus('available')">批量启用</button>
+            <button class="btn-disable btn-sm" onclick="batchUpdateStatus('disabled')">批量禁用</button>
+        </div>
     </div>
 
     <div class="modal-overlay" id="register-modal" onclick="if(event.target===this)hideRegisterModal()">
@@ -289,6 +400,32 @@
                 location.reload();
             }
         }
+        function setApiCallInfo(text) {
+            const info = document.getElementById('api-call-info');
+            const card = document.getElementById('api-call-card');
+            if (!info || !card) return;
+
+            const timestamp = new Date().toLocaleTimeString('zh-CN');
+            const isError = text.startsWith('失败：');
+            const isPending = text.startsWith('调用中：');
+
+            info.textContent = `[${timestamp}] ${text}`;
+            info.style.color = isError ? '#721c24' : (isPending ? '#856404' : '#155724');
+
+            card.classList.remove('is-pending', 'is-success', 'is-error');
+            if (isError) {
+                card.classList.add('is-error');
+            } else if (isPending) {
+                card.classList.add('is-pending');
+            } else {
+                card.classList.add('is-success');
+            }
+
+            if (typeof card.scrollIntoView === 'function') {
+                card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            }
+        }
+
         // 页面加载时检查 token
         if (!getApiToken()) {
             promptToken();
@@ -306,6 +443,23 @@
                 const summaryData = await summaryResp.json();
                 const poolData = await poolResp.json();
                 const currentData = await currentResp.json();
+
+                // 读取后端开关，动态控制注册入口状态
+                try {
+                    const configResp = await authFetch('/api/config');
+                    const configData = await configResp.json();
+                    const registerBtn = document.getElementById('btn-register');
+                    if (registerBtn && configData?.success) {
+                        const features = configData.features || {};
+                        const canRegister = Boolean(features.account_admin_enabled) && Boolean(features.account_register_enabled);
+                        registerBtn.disabled = !canRegister;
+                        registerBtn.className = canRegister ? 'btn-success' : 'btn-secondary';
+                        registerBtn.textContent = canRegister ? '➕ 注册新账号' : '➕ 注册新账号（已暂缓）';
+                        registerBtn.title = canRegister ? '打开批量注册弹窗' : '自动注册功能已暂缓';
+                    }
+                } catch (_e) {
+                    // 配置接口失败时保持默认禁用状态，避免误开放
+                }
 
                 if (summaryData.success) {
                     const summary = summaryData.summary;
@@ -381,60 +535,100 @@
         }
 
         async function loadRecentUsed() {
-            document.getElementById('recent-loading').style.display = 'block';
-            document.getElementById('recent-table').style.display = 'none';
+            const loadingEl = document.getElementById('recent-loading');
+            const listEl = document.getElementById('recent-list');
+            loadingEl.style.display = 'block';
+            listEl.style.display = 'none';
 
             try {
                 const response = await authFetch('/api/accounts/recent');
                 const data = await response.json();
 
-                if (data.success && data.accounts) {
+                if (data.success && data.accounts && data.accounts.length > 0) {
                     renderRecentAccounts(data.accounts);
-                    document.getElementById('recent-table').style.display = 'table';
+                    listEl.style.display = 'block';
+                } else {
+                    listEl.textContent = '暂无最近使用记录';
+                    listEl.style.display = 'block';
                 }
-                document.getElementById('recent-loading').style.display = 'none';
+                loadingEl.style.display = 'none';
             } catch (error) {
-                document.getElementById('recent-loading').style.display = 'none';
+                loadingEl.style.display = 'none';
+                listEl.textContent = '加载最近使用记录失败';
+                listEl.style.display = 'block';
                 showError('加载最近使用记录失败: ' + error.message);
             }
         }
 
-        function renderRecentAccounts(accounts) {
-            const tbody = document.getElementById('recent-body');
-            tbody.innerHTML = '';
+        function escapeHtml(value) {
+            const str = String(value ?? '');
+            return str
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
 
-            accounts.forEach(account => {
-                const tr = document.createElement('tr');
-                tr.innerHTML = `
-                    <td>${account.email}</td>
-                    <td>${account.local_id.substring(0, 20)}...</td>
-                    <td><span class="status-badge status-${account.status}">${account.status}</span></td>
-                    <td>${account.remaining_limit}</td>
-                    <td>${account.use_count || 0}</td>
-                    <td>${account.last_used ? new Date(account.last_used).toLocaleString('zh-CN') : '-'}</td>
-                `;
-                tbody.appendChild(tr);
+        function normalizeStatus(status) {
+            return status === 'disabled' ? 'disabled' : 'available';
+        }
+
+        function renderRecentAccounts(accounts) {
+            const listEl = document.getElementById('recent-list');
+            if (!listEl) return;
+
+            const lines = accounts.slice(0, 5).map(account => {
+                const statusValue = normalizeStatus(account.status);
+                const statusText = statusValue === 'disabled' ? '已禁用' : '可用';
+                const email = escapeHtml(account.email ?? '-');
+                const remaining = Number(account.remaining_limit) || 0;
+                const usedCount = Number(account.use_count) || 0;
+                const lastUsed = account.last_used ? new Date(account.last_used).toLocaleString('zh-CN') : '-';
+                return `• ${email}｜${statusText}｜剩余 ${remaining}｜使用 ${usedCount} 次｜最后使用 ${lastUsed}`;
             });
+
+            listEl.textContent = lines.length > 0 ? lines.join('\n') : '暂无最近使用记录';
+            listEl.style.whiteSpace = 'pre-line';
         }
 
         function renderAccounts(accounts) {
             const tbody = document.getElementById('accounts-body');
             tbody.innerHTML = '';
+            document.getElementById('select-all').checked = false;
+            updateBatchBar();
 
             accounts.forEach(account => {
+                const accountId = Number(account.id);
+                if (!Number.isFinite(accountId)) {
+                    return;
+                }
+
                 const tr = document.createElement('tr');
-                tr.id = `account-row-${account.id}`;
+                tr.id = `account-row-${accountId}`;
+                const statusValue = normalizeStatus(account.status);
+                const isDisabled = statusValue === 'disabled';
+                const toggleBtnClass = isDisabled ? 'btn-enable' : 'btn-disable';
+                const toggleBtnText = isDisabled ? '启用' : '禁用';
+                const toggleTarget = isDisabled ? 'available' : 'disabled';
+                const localIdText = typeof account.local_id === 'string' && account.local_id
+                    ? `${account.local_id.substring(0, 20)}...`
+                    : '-';
                 tr.innerHTML = `
-                    <td>${account.id}</td>
-                    <td>${account.email}</td>
-                    <td>${account.local_id.substring(0, 20)}...</td>
-                    <td><span class="status-badge status-${account.status}">${account.status}</span></td>
-                    <td>${account.total_limit}</td>
-                    <td>${account.used_limit}</td>
-                    <td>${account.remaining_limit}</td>
+                    <td><input type="checkbox" class="row-checkbox" data-id="${accountId}" onchange="updateBatchBar()"></td>
+                    <td>${accountId}</td>
+                    <td>${escapeHtml(account.email ?? '')}</td>
+                    <td>${escapeHtml(localIdText)}</td>
+                    <td><span class="status-badge status-${statusValue}">${statusValue}</span></td>
+                    <td>${renderQuotaCell(account)}</td>
                     <td>${account.use_count || 0}</td>
                     <td>${account.last_check ? new Date(account.last_check).toLocaleString('zh-CN') : '-'}</td>
-                    <td><button class="btn-sm btn-warning" onclick="verifySingle(${account.id}, this)">检查</button></td>
+                    <td>
+                        <button class="btn-sm ${toggleBtnClass}" onclick="toggleStatus(${accountId}, '${toggleTarget}', this)">
+                            ${toggleBtnText}
+                        </button>
+                        <button class="btn-sm btn-warning" onclick="refreshQuota(${accountId}, this)">检查额度</button>
+                    </td>
                 `;
                 tbody.appendChild(tr);
             });
@@ -471,41 +665,117 @@
             }, 5000);
         }
 
-        // 单个账号额度检查
-        async function verifySingle(accountId, btn) {
+        function showSuccess(message) {
+            const successDiv = document.getElementById('success');
+            successDiv.textContent = message;
+            successDiv.style.display = 'block';
+            setTimeout(() => {
+                successDiv.style.display = 'none';
+            }, 5000);
+        }
+
+        // 渲染额度单元格
+        function renderQuotaCell(account) {
+            const statusValue = normalizeStatus(account.status);
+            const isDisabled = statusValue === 'disabled';
+            const used = Number(account.used_limit) || 0;
+            const total = Number(account.total_limit) || 0;
+            const remaining = Number(account.remaining_limit) || 0;
+            const isUnlimited = account.is_unlimited || false;
+            const nextRefresh = account.next_refresh_time;
+
+            if (isDisabled) {
+                return `<div class="quota-cell quota-disabled">
+                    <span style="color:#999;">已禁用</span>
+                </div>`;
+            }
+
+            if (isUnlimited) {
+                return `<div class="quota-cell">
+                    <div class="quota-text" style="color:#10b981;font-weight:600;">∞ 无限</div>
+                    ${nextRefresh ? `<div class="quota-next-refresh">下次刷新：${new Date(nextRefresh).toLocaleString('zh-CN')}</div>` : ''}
+                </div>`;
+            }
+
+            const pct = total > 0 ? (remaining / total * 100) : 0;
+            let textColorClass = 'gray';
+            let barColorClass = 'quota-bar-gray';
+            if (pct < 30) {
+                textColorClass = 'red';
+                barColorClass = 'quota-bar-red';
+            } else if (pct < 70) {
+                textColorClass = 'orange';
+                barColorClass = 'quota-bar-orange';
+            } else {
+                textColorClass = 'green';
+                barColorClass = 'quota-bar-green';
+            }
+
+            return `<div class="quota-cell">
+                <div class="quota-text ${textColorClass}">${used} / ${total} <span style="font-size:12px;">(剩余${remaining})</span></div>
+                <div class="quota-bar-wrap">
+                    <div class="quota-bar-inner ${barColorClass}" style="width:${Math.min(pct, 100)}%;"></div>
+                </div>
+                ${nextRefresh ? `<div class="quota-next-refresh">下次刷新：${new Date(nextRefresh).toLocaleString('zh-CN')}</div>` : ''}
+            </div>`;
+        }
+
+        // 单个账号刷新额度
+        async function refreshQuota(accountId, btn) {
+            const endpoint = `/api/accounts/${accountId}/verify-quota`;
+            const calledApi = `POST ${endpoint}`;
             const origText = btn.textContent;
             btn.textContent = '检查中...';
             btn.disabled = true;
+            btn.classList.add('loading');
+            setApiCallInfo(`调用中：${calledApi}`);
+
             try {
-                const resp = await authFetch(`/api/accounts/${accountId}/verify-quota`, { method: 'POST' });
+                const resp = await authFetch(endpoint, { method: 'POST' });
                 const data = await resp.json();
-                if (data.success && data.result) {
-                    const r = data.result;
-                    if (r.valid) {
-                        btn.textContent = '✅ 有效';
-                        btn.style.background = '#28a745';
-                        btn.style.color = 'white';
-                    } else {
-                        btn.textContent = '❌ 失效';
-                        btn.style.background = '#dc3545';
-                        btn.style.color = 'white';
-                    }
+
+                if (!resp.ok) {
+                    const errMsg = data.detail || data.error || `HTTP ${resp.status}`;
+                    setApiCallInfo(`失败：${calledApi}｜${errMsg}`);
+                    showError(`检查失败（${calledApi}）: ${errMsg}`);
+                    return;
+                }
+
+                const result = data.result || {};
+                if (data.success && result.valid) {
+                    const quota = result.quota || {};
+                    const requestLimit = Number(quota.request_limit);
+                    const used = Number(quota.used);
+                    const remaining = Number(quota.remaining);
+                    const quotaText = Number.isFinite(requestLimit) && Number.isFinite(used)
+                        ? `额度 ${used}/${requestLimit}${Number.isFinite(remaining) ? `（剩余 ${remaining}）` : ''}`
+                        : '额度已刷新';
+
+                    await loadAccounts(currentPage);
+                    await loadSummary();
+                    await loadRecentUsed();
+                    setApiCallInfo(`完成：${calledApi}｜账号 #${accountId}｜${quotaText}`);
+                    showSuccess(`检查完成（${calledApi}）：账号 #${accountId}，${quotaText}`);
+                } else {
+                    const errMsg = result.error || data.detail || data.error || '未知错误';
+                    setApiCallInfo(`失败：${calledApi}｜${errMsg}`);
+                    showError(`检查失败（${calledApi}）: ${errMsg}`);
                 }
             } catch (e) {
-                btn.textContent = '❌ 错误';
-                showError('检查失败: ' + e.message);
-            }
-            setTimeout(() => {
+                setApiCallInfo(`失败：${calledApi}｜${e.message}`);
+                showError(`检查失败（${calledApi}）: ${e.message}`);
+            } finally {
                 btn.textContent = origText;
                 btn.disabled = false;
-                btn.style.background = '';
-                btn.style.color = '';
-                loadAccounts(currentPage);
-            }, 2000);
+                btn.classList.remove('loading');
+            }
         }
 
-        // 批量额度检查
-        async function batchVerifyQuota() {
+
+        // 批量检查额度
+        async function batchRefreshQuota() {
+            const endpoint = '/api/accounts/verify-quota';
+            const calledApi = `POST ${endpoint}`;
             const btn = document.getElementById('btn-verify');
             const progress = document.getElementById('verify-progress');
             btn.disabled = true;
@@ -514,41 +784,72 @@
             document.getElementById('verify-bar').style.width = '0%';
             document.getElementById('verify-status').textContent = '正在批量检查所有账号额度...';
             document.getElementById('verify-count').textContent = '';
-            document.getElementById('verify-result').textContent = '';
+            document.getElementById('verify-result').textContent = `调用接口：${calledApi}`;
+            setApiCallInfo(`调用中：${calledApi}`);
 
             try {
-                const resp = await authFetch('/api/accounts/verify-quota', { method: 'POST' });
+                const resp = await authFetch(endpoint, { method: 'POST' });
                 const data = await resp.json();
+
+                if (!resp.ok) {
+                    const errMsg = data.detail || data.error || `HTTP ${resp.status}`;
+                    document.getElementById('verify-status').textContent = '检查失败';
+                    document.getElementById('verify-result').textContent = `调用接口：${calledApi}｜${errMsg}`;
+                    setApiCallInfo(`失败：${calledApi}｜${errMsg}`);
+                    showError(`批量检查失败（${calledApi}）: ${errMsg}`);
+                    return;
+                }
+
                 if (data.success && data.results) {
                     const r = data.results;
                     document.getElementById('verify-bar').style.width = '100%';
                     document.getElementById('verify-status').textContent = '检查完成！';
                     document.getElementById('verify-count').textContent = `${r.total}/${r.total}`;
                     document.getElementById('verify-result').textContent =
-                        `✅ 有效: ${r.valid}  |  ❌ 失效: ${r.invalid}`;
+                        `调用接口：${calledApi}｜✅ 有效: ${r.valid}  |  ❌ 失效: ${r.invalid}`;
                     // 刷新数据
                     loadSummary();
                     loadAccounts(currentPage);
                     loadRecentUsed();
+                    setApiCallInfo(`完成：${calledApi}｜有效 ${r.valid}｜失效 ${r.invalid}`);
+                    showSuccess(`批量检查完成（${calledApi}）：有效 ${r.valid}，失效 ${r.invalid}`);
+                } else {
+                    const errorMsg = data.detail || data.error || '返回结果缺少 results';
+                    document.getElementById('verify-status').textContent = '检查失败';
+                    document.getElementById('verify-result').textContent = `调用接口：${calledApi}｜${errorMsg}`;
+                    setApiCallInfo(`失败：${calledApi}｜${errorMsg}`);
+                    showError(`批量检查失败（${calledApi}）: ${errorMsg}`);
                 }
             } catch (e) {
                 document.getElementById('verify-status').textContent = '检查失败';
-                document.getElementById('verify-result').textContent = e.message;
-                showError('批量检查失败: ' + e.message);
+                document.getElementById('verify-result').textContent = `调用接口：${calledApi}｜${e.message}`;
+                setApiCallInfo(`失败：${calledApi}｜${e.message}`);
+                showError(`批量检查失败（${calledApi}）: ${e.message}`);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '🔍 批量检查额度';
+                setTimeout(() => { progress.style.display = 'none'; }, 5000);
             }
-            btn.disabled = false;
-            btn.textContent = '🔍 检查全部额度';
-            setTimeout(() => { progress.style.display = 'none'; }, 5000);
         }
 
-        // 注册弹窗
+        // 注册入口（由 /api/config 动态控制是否可用）
         function showRegisterModal() {
+            const btn = document.getElementById('btn-register');
+            if (!btn || btn.disabled) {
+                showError('自动注册功能已暂缓，当前版本暂不开放。');
+                return;
+            }
             document.getElementById('register-modal').style.display = 'flex';
             document.getElementById('reg-status').style.display = 'none';
         }
+
         function hideRegisterModal() {
-            document.getElementById('register-modal').style.display = 'none';
+            const modal = document.getElementById('register-modal');
+            if (modal) {
+                modal.style.display = 'none';
+            }
         }
+
         async function doRegister() {
             const count = parseInt(document.getElementById('reg-count').value) || 5;
             const delay = parseFloat(document.getElementById('reg-delay').value) || 2;
@@ -573,7 +874,6 @@
                     const s = data.stats;
                     status.style.color = '#155724';
                     status.textContent = `✅ 完成！成功 ${s.success} 个，失败 ${s.failed} 个，已入库 ${s.saved_to_db} 个`;
-                    // 刷新列表
                     loadSummary();
                     loadAccounts(currentPage);
                 } else {
@@ -584,6 +884,7 @@
                 status.style.color = '#721c24';
                 status.textContent = '❌ ' + e.message;
             }
+
             btn.disabled = false;
             btn.textContent = '开始注册';
         }
@@ -603,6 +904,81 @@
             loadSummary();
             loadRecentUsed();
         }, 30000);
+
+        // === 启用/禁用 & 批量操作 ===
+
+        async function toggleStatus(accountId, newStatus, btn) {
+            const origText = btn.textContent;
+            btn.textContent = '处理中...';
+            btn.disabled = true;
+            try {
+                const resp = await authFetch(`/api/accounts/${accountId}/status`, {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ status: newStatus }),
+                });
+                const data = await resp.json();
+                if (data.success) {
+                    loadAccounts(currentPage);
+                    loadSummary();
+                } else {
+                    showError('状态更新失败: ' + (data.detail || '未知错误'));
+                    btn.textContent = origText;
+                    btn.disabled = false;
+                }
+            } catch (e) {
+                showError('状态更新失败: ' + e.message);
+                btn.textContent = origText;
+                btn.disabled = false;
+            }
+        }
+
+        function toggleSelectAll(masterCheckbox) {
+            const checkboxes = document.querySelectorAll('.row-checkbox');
+            checkboxes.forEach(cb => { cb.checked = masterCheckbox.checked; });
+            updateBatchBar();
+        }
+
+        function getSelectedIds() {
+            const checked = document.querySelectorAll('.row-checkbox:checked');
+            return Array.from(checked).map(cb => parseInt(cb.dataset.id));
+        }
+
+        function updateBatchBar() {
+            const ids = getSelectedIds();
+            const bar = document.getElementById('batch-bar');
+            const countEl = document.getElementById('selected-count');
+            if (ids.length > 0) {
+                bar.classList.add('visible');
+                countEl.textContent = `已选 ${ids.length} 个`;
+            } else {
+                bar.classList.remove('visible');
+            }
+        }
+
+        async function batchUpdateStatus(newStatus) {
+            const ids = getSelectedIds();
+            if (ids.length === 0) return;
+            const label = newStatus === 'available' ? '启用' : '禁用';
+            if (!confirm(`确定要批量${label} ${ids.length} 个账号吗？`)) return;
+
+            try {
+                const resp = await authFetch('/api/accounts/batch-status', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ account_ids: ids, status: newStatus }),
+                });
+                const data = await resp.json();
+                if (data.success) {
+                    loadAccounts(currentPage);
+                    loadSummary();
+                } else {
+                    showError('批量操作失败: ' + (data.detail || '未知错误'));
+                }
+            } catch (e) {
+                showError('批量操作失败: ' + e.message);
+            }
+        }
     </script>
 </body>
 </html>

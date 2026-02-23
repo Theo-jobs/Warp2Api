@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Anthropic 指定账号测试</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: #f5f5f5;
+            color: #333;
+        }
+        .container {
+            max-width: 1100px;
+            margin: 0 auto;
+        }
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+        .header h1 {
+            margin: 0;
+            font-size: 24px;
+        }
+        .btn-link {
+            display: inline-block;
+            padding: 8px 12px;
+            text-decoration: none;
+            background: #6c757d;
+            color: #fff;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+        .card {
+            background: white;
+            border-radius: 10px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+            padding: 16px;
+            margin-bottom: 14px;
+        }
+        .card-title {
+            font-weight: 600;
+            margin-bottom: 12px;
+            font-size: 16px;
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+        }
+        .form-group { margin-bottom: 12px; }
+        label {
+            display: block;
+            margin-bottom: 6px;
+            font-size: 13px;
+            color: #444;
+        }
+        select, input, textarea {
+            width: 100%;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            padding: 10px;
+            font-size: 14px;
+            background: #fff;
+        }
+        textarea {
+            min-height: 120px;
+            resize: vertical;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+        }
+        .btn {
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            padding: 10px 16px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        .btn:disabled {
+            background: #9db7dc;
+            cursor: not-allowed;
+        }
+        .status {
+            font-size: 13px;
+            margin-top: 8px;
+            min-height: 20px;
+        }
+        .status.success { color: #155724; }
+        .status.error { color: #721c24; }
+        .status.info { color: #0c5460; }
+        .mono {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+            white-space: pre-wrap;
+            word-break: break-word;
+            background: #0f172a;
+            color: #e2e8f0;
+            border-radius: 8px;
+            padding: 12px;
+            min-height: 180px;
+            max-height: 460px;
+            overflow: auto;
+            font-size: 13px;
+            line-height: 1.45;
+        }
+        .meta {
+            font-size: 12px;
+            color: #666;
+            margin-top: 8px;
+            display: flex;
+            gap: 14px;
+            flex-wrap: wrap;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1>🧪 Anthropic 指定账号测试</h1>
+        <a class="btn-link" href="/gui">返回账号管理</a>
+    </div>
+
+    <div class="card">
+        <div class="card-title">测试参数</div>
+        <div class="grid">
+            <div>
+                <div class="form-group">
+                    <label for="account-select">指定账号</label>
+                    <select id="account-select"></select>
+                </div>
+                <div class="form-group">
+                    <label for="model-select">模型</label>
+                    <select id="model-select"></select>
+                </div>
+                <div class="form-group">
+                    <label for="max-tokens">max_tokens</label>
+                    <input id="max-tokens" type="number" min="1" max="8192" value="1024" />
+                </div>
+            </div>
+            <div>
+                <div class="form-group">
+                    <label for="system-input">System（可选）</label>
+                    <textarea id="system-input" placeholder="例如：你是一个简洁的助手。"></textarea>
+                </div>
+            </div>
+        </div>
+
+        <div class="form-group">
+            <label for="prompt-input">User Prompt</label>
+            <textarea id="prompt-input" placeholder="输入测试内容，例如：请用三句话介绍你自己"></textarea>
+        </div>
+
+        <button id="send-btn" class="btn" onclick="sendTestRequest()">发送测试请求</button>
+        <div id="status" class="status info"></div>
+    </div>
+
+    <div class="card">
+        <div class="card-title">流式输出</div>
+        <div id="stream-output" class="mono"></div>
+        <div class="meta">
+            <span id="meta-account">账号：-</span>
+            <span id="meta-model">模型：-</span>
+            <span id="meta-time">耗时：-</span>
+        </div>
+    </div>
+</div>
+
+<script>
+    function getApiToken() {
+        return localStorage.getItem('api_token') || '';
+    }
+
+    function promptToken() {
+        const current = getApiToken();
+        const token = prompt('请输入 API_TOKEN', current || '');
+        if (token && token.trim()) {
+            localStorage.setItem('api_token', token.trim());
+            return token.trim();
+        }
+        return '';
+    }
+
+    function authHeaders() {
+        const token = getApiToken();
+        return {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json',
+        };
+    }
+
+    async function authFetch(url, options = {}) {
+        let token = getApiToken();
+        if (!token) {
+            token = promptToken();
+            if (!token) throw new Error('未提供 API_TOKEN');
+        }
+
+        const headers = {
+            ...authHeaders(),
+            ...(options.headers || {}),
+        };
+
+        const response = await fetch(url, { ...options, headers });
+        if (response.status === 401) {
+            const retryToken = promptToken();
+            if (!retryToken) throw new Error('认证失败：缺少 API_TOKEN');
+            const retryHeaders = {
+                ...headers,
+                Authorization: `Bearer ${retryToken}`,
+            };
+            return fetch(url, { ...options, headers: retryHeaders });
+        }
+        return response;
+    }
+
+    function setStatus(text, cls = 'info') {
+        const el = document.getElementById('status');
+        el.className = `status ${cls}`;
+        el.textContent = text;
+    }
+
+    function setMeta({ account = '-', model = '-', time = '-' }) {
+        document.getElementById('meta-account').textContent = `账号：${account}`;
+        document.getElementById('meta-model').textContent = `模型：${model}`;
+        document.getElementById('meta-time').textContent = `耗时：${time}`;
+    }
+
+    async function loadAccounts() {
+        const res = await authFetch('/api/accounts?page=1&page_size=100&status=available');
+        if (!res.ok) {
+            throw new Error(`加载账号失败: HTTP ${res.status}`);
+        }
+        const data = await res.json();
+        const select = document.getElementById('account-select');
+        const list = data.accounts || [];
+
+        if (list.length === 0) {
+            select.innerHTML = '<option value="">无可用账号</option>';
+            return;
+        }
+
+        select.innerHTML = '';
+        for (const account of list) {
+            const remaining = Number(account.remaining_limit || 0);
+            const option = document.createElement('option');
+            option.value = String(account.id);
+            option.textContent = `#${account.id} | ${account.email} | 剩余 ${remaining}`;
+            select.appendChild(option);
+        }
+    }
+
+    async function loadModels() {
+        const res = await authFetch('/api/models', { method: 'GET' });
+        if (!res.ok) {
+            throw new Error(`加载模型失败: HTTP ${res.status}`);
+        }
+        const data = await res.json();
+        const models = (data.models || []).map(m => m.id).filter(Boolean);
+        const select = document.getElementById('model-select');
+
+        if (models.length === 0) {
+            select.innerHTML = '<option value="claude-4-6-opus-high">claude-4-6-opus-high</option>';
+            return;
+        }
+
+        const options = models
+            .map(id => ({ id: String(id) }))
+            .sort((a, b) => a.id.localeCompare(b.id));
+
+        select.innerHTML = '';
+        for (const item of options) {
+            const option = document.createElement('option');
+            option.value = item.id;
+            option.textContent = item.id;
+            select.appendChild(option);
+        }
+
+        const preferred = ['claude-4-6-opus-high', 'claude-4-6-opus-max', 'claude-4-6-sonnet-high'];
+        const picked = preferred.find(id => models.includes(id));
+        if (picked) select.value = picked;
+    }
+
+    async function sendTestRequest() {
+        const accountId = Number(document.getElementById('account-select').value || 0);
+        const model = document.getElementById('model-select').value;
+        const prompt = document.getElementById('prompt-input').value.trim();
+        const system = document.getElementById('system-input').value.trim();
+        const maxTokens = Number(document.getElementById('max-tokens').value || 1024);
+
+        if (!accountId) {
+            setStatus('请选择账号', 'error');
+            return;
+        }
+        if (!prompt) {
+            setStatus('请输入 Prompt', 'error');
+            return;
+        }
+
+        const btn = document.getElementById('send-btn');
+        const output = document.getElementById('stream-output');
+        const startedAt = Date.now();
+        output.textContent = '';
+        setStatus(`调用中：POST /api/test/anthropic/messages（账号 #${accountId}）`, 'info');
+        setMeta({ account: `#${accountId}`, model, time: '进行中...' });
+        btn.disabled = true;
+
+        try {
+            const response = await authFetch('/api/test/anthropic/messages', {
+                method: 'POST',
+                body: JSON.stringify({
+                    account_id: accountId,
+                    model,
+                    prompt,
+                    system,
+                    max_tokens: maxTokens,
+                }),
+            });
+
+            if (!response.ok || !response.body) {
+                const msg = await response.text();
+                throw new Error(`HTTP ${response.status} ${msg || ''}`.trim());
+            }
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            let plainText = '';
+
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
+
+                buffer += decoder.decode(value, { stream: true });
+                const events = buffer.split('\n\n');
+                buffer = events.pop() || '';
+
+                for (const eventText of events) {
+                    const lines = eventText.split('\n').filter(Boolean);
+                    let eventType = '';
+                    const dataLines = [];
+
+                    for (const line of lines) {
+                        if (line.startsWith('event:')) {
+                            eventType = line.slice(6).trim();
+                        } else if (line.startsWith('data:')) {
+                            dataLines.push(line.slice(5).trim());
+                        }
+                    }
+
+                    const payloadRaw = dataLines.join('\n');
+                    if (!payloadRaw) continue;
+
+                    let payload;
+                    try {
+                        payload = JSON.parse(payloadRaw);
+                    } catch {
+                        continue;
+                    }
+
+                    if (eventType === 'content_block_delta' && payload?.delta?.type === 'text_delta') {
+                        const delta = payload.delta.text || '';
+                        plainText += delta;
+                        output.textContent = plainText;
+                        output.scrollTop = output.scrollHeight;
+                    }
+                }
+            }
+
+            const cost = ((Date.now() - startedAt) / 1000).toFixed(2);
+            setStatus(`完成：账号 #${accountId}，模型 ${model}`, 'success');
+            setMeta({ account: `#${accountId}`, model, time: `${cost}s` });
+
+            if (!plainText) {
+                output.textContent = '[无文本输出，可能是 tool_use 或上游未返回内容]';
+            }
+        } catch (e) {
+            const cost = ((Date.now() - startedAt) / 1000).toFixed(2);
+            const msg = e?.message || String(e);
+            setStatus(`失败：${msg}`, 'error');
+            setMeta({ account: `#${accountId}`, model, time: `${cost}s` });
+            output.textContent = `ERROR\n${msg}`;
+        } finally {
+            btn.disabled = false;
+        }
+    }
+
+    async function bootstrap() {
+        try {
+            await Promise.all([loadAccounts(), loadModels()]);
+            setStatus('就绪：请选择账号和模型后发送测试请求', 'info');
+        } catch (e) {
+            setStatus(`初始化失败：${e.message || e}`, 'error');
+        }
+    }
+
+    bootstrap();
+</script>
+</body>
+</html>

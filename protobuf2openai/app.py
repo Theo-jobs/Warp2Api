@@ -51,6 +51,15 @@ if STATIC_DIR.exists():
     logger.info("✅ 静态文件服务已启用: /static")
 
 
+@app.get("/healthz")
+async def health_check() -> dict[str, str]:
+    """容器健康检查端点。"""
+    return {
+        "status": "ok",
+        "service": "Warp Bridge API - Anthropic Messages",
+    }
+
+
 # GUI 入口
 @app.get("/gui")
 async def serve_gui():

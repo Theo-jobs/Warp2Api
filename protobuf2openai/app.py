@@ -115,6 +115,19 @@ def _fetch_account_tokens(db_path: Path, account_id: int) -> dict[str, Any] | No
     return dict(row) if row else None
 
 
+@app.get("/v1/models")
+async def list_models_v1(request: Request) -> dict[str, Any]:
+    """OpenAI/Anthropic 客户端常用模型列表端点。"""
+    await authenticate_request(request)
+
+    from warp2protobuf.config.models import get_all_unique_models
+
+    return {
+        "object": "list",
+        "data": get_all_unique_models(),
+    }
+
+
 @app.get("/api/models", dependencies=[Depends(verify_admin_token)])
 async def list_available_models() -> dict[str, Any]:
     """返回可用模型列表（供测试页下拉选择）。"""

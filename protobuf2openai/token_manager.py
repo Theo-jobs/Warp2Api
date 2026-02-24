@@ -307,20 +307,27 @@ class TokenManager:
         )
 
     async def _background_refresh_loop(self) -> None:
-        """后台循环：每 5 分钟扫描即将过期的 token，逐个刷新。"""
-        check_interval = 300  # 5 分钟检查一次
+        """后台循环：动态计算下次检查时间，基于最近即将过期的 token。"""
+        default_interval = 300  # 无账号时默认 5 分钟
         while True:
-            await asyncio.sleep(check_interval)
+            next_interval = default_interval
             try:
-                await self._refresh_expiring_tokens()
+                next_interval = await self._refresh_expiring_tokens() or default_interval
+                # 限制在 60s ~ 600s 之间
+                next_interval = max(60, min(600, next_interval))
             except Exception as e:
                 logger.error("[TokenManager] 后台预刷新异常: %s", e)
+            await asyncio.sleep(next_interval)
 
-    async def _refresh_expiring_tokens(self) -> None:
-        """扫描即将过期的 token（10 分钟内到期），逐个刷新。"""
+    async def _refresh_expiring_tokens(self) -> int:
+        """扫描即将过期的 token（10 分钟内到期），逐个刷新。
+
+        Returns:
+            建议的下次检查间隔（秒）。
+        """
         if self.is_firebase_blocked():
             logger.debug("[TokenManager] Firebase 限流中，跳过预刷新")
-            return
+            return 300  # 限流期间 5 分钟后再查
 
         threshold = time.time() + PRE_REFRESH_BUFFER_SECONDS
         with sqlite3.connect(str(self.db_path)) as conn:
@@ -344,7 +351,8 @@ class TokenManager:
             ).fetchall()
 
         if not rows:
-            return
+            # 没有即将过期的 token，查询下一个最近过期的来计算间隔
+            return self._calc_next_check_interval()
 
         # 过滤：token_expires_at=0 的需要额外检查是否真的过期
         to_refresh = []
@@ -360,7 +368,7 @@ class TokenManager:
                     to_refresh.append(account)
 
         if not to_refresh:
-            return
+            return self._calc_next_check_interval()
 
         refreshed = 0
         for account in to_refresh:
@@ -398,6 +406,32 @@ class TokenManager:
 
         if refreshed > 0:
             logger.info("[TokenManager] 预刷新完成，本轮刷新 %d 个", refreshed)
+
+        return self._calc_next_check_interval()
+
+    def _calc_next_check_interval(self) -> int:
+        """根据最近即将过期的 token 计算下次检查间隔（秒）。"""
+        try:
+            with sqlite3.connect(str(self.db_path)) as conn:
+                row = conn.execute(
+                    """
+                    SELECT MIN(token_expires_at) as nearest
+                    FROM accounts
+                    WHERE status = 'available'
+                      AND token_expires_at > ?
+                      AND refresh_token IS NOT NULL AND refresh_token != ''
+                    """,
+                    (time.time(),),
+                ).fetchone()
+                if row and row[0]:
+                    # 在过期前 PRE_REFRESH_BUFFER 时刷新
+                    seconds_until_refresh = row[0] - PRE_REFRESH_BUFFER_SECONDS - time.time()
+                    interval = max(60, int(seconds_until_refresh))
+                    logger.debug("[TokenManager] 下次预刷新检查: %d 秒后", interval)
+                    return interval
+        except Exception:
+            pass
+        return 300  # 默认 5 分钟
 
 
 def _extract_exp_from_jwt(token: str) -> float:

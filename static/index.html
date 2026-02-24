@@ -369,6 +369,7 @@
             <span class="selected-count" id="selected-count">已选 0 个</span>
             <button class="btn-enable btn-sm" onclick="batchUpdateStatus('available')">✅ 批量启用</button>
             <button class="btn-disable btn-sm" onclick="batchUpdateStatus('disabled')">🚫 批量禁用</button>
+            <button class="btn-sm" style="background:#dc3545;color:#fff;" onclick="batchDeleteAccounts()">🗑 批量删除</button>
             <span style="color:#ccc;">|</span>
             <button class="btn-sm btn-secondary" onclick="selectByStatus('available')">选中所有可用</button>
             <button class="btn-sm btn-secondary" onclick="selectByStatus('disabled')">选中所有禁用</button>
@@ -663,6 +664,7 @@
                         </button>
                         <button class="btn-sm btn-warning" onclick="refreshQuota(${accountId}, this)">检查额度</button>
                         <button class="btn-sm" style="background:#e67e22;color:#fff;" onclick="forceRefreshSingle(${accountId}, this)">刷新Token</button>
+                        <button class="btn-sm" style="background:#dc3545;color:#fff;" onclick="deleteAccount(${accountId}, '${escapeHtml(account.email ?? '')}')">删除</button>
                     </td>
                 `;
                 tbody.appendChild(tr);
@@ -1116,6 +1118,47 @@
                 }
             } catch (e) {
                 showError('重置用量失败: ' + e.message);
+            }
+        }
+
+        async function deleteAccount(accountId, email) {
+            if (!confirm(`确认删除账号 ${email} (#${accountId})？此操作不可恢复！`)) return;
+            try {
+                const resp = await authFetch(`/api/accounts/${accountId}`, { method: 'DELETE' });
+                const data = await resp.json();
+                if (data.success) {
+                    showSuccess(data.message);
+                    loadAccounts(currentPage);
+                    loadSummary();
+                } else {
+                    showError('删除失败: ' + (data.detail || '未知错误'));
+                }
+            } catch (e) {
+                showError('删除账号失败: ' + e.message);
+            }
+        }
+
+        async function batchDeleteAccounts() {
+            const ids = getSelectedIds();
+            if (ids.length === 0) { showError('请先选择要删除的账号'); return; }
+            if (!confirm(`确认删除选中的 ${ids.length} 个账号？此操作不可恢复！`)) return;
+            try {
+                const resp = await authFetch('/api/accounts/batch-delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ids })
+                });
+                const data = await resp.json();
+                if (data.success) {
+                    alert(data.message);
+                    clearSelection();
+                    loadAccounts(currentPage);
+                    loadSummary();
+                } else {
+                    showError('批量删除失败: ' + (data.detail || '未知错误'));
+                }
+            } catch (e) {
+                showError('批量删除失败: ' + e.message);
             }
         }
 

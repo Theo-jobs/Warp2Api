@@ -410,14 +410,35 @@ def _is_transient_error(err: Exception) -> bool:
     )
 
 
+def _save_refreshed_token(account_id: int, new_token: str) -> None:
+    """将刷新后的 token 写回数据库，更新 token_expires_at。"""
+    try:
+        expires_at = time.time() + 3600  # Firebase id_token 60 分钟有效
+        with sqlite3.connect(ACCOUNT_DB_PATH) as conn:
+            conn.execute(
+                "UPDATE accounts SET id_token = ?, token_expires_at = ?, updated_at = ? WHERE id = ?",
+                (new_token, expires_at, datetime.now().isoformat(), account_id),
+            )
+            conn.commit()
+        logger.info("[SaveToken] 已保存刷新后的 token: account_id=%d expires_in=60min", account_id)
+    except Exception as e:
+        logger.warning("[SaveToken] 保存 token 失败: account_id=%d error=%s", account_id, e)
+
+
 async def _resolve_quota_with_token_strategy(
     id_token: str | None,
     refresh_token: str | None,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], str | None]:
+    """查询额度，如果触发了 token 刷新则一并返回新 token。
+
+    Returns:
+        (quota_info, refreshed_token) — refreshed_token 为 None 表示未刷新。
+    """
     from warp2protobuf.core.auth import refresh_access_token_with_refresh_token, is_token_expired
     from warp2protobuf.core.quota import get_request_limit_info
 
     token = ""
+    refreshed_token: str | None = None
     from_id_token = False
 
     # 检查 Firebase 全局限流，避免绕过 TokenManager 直接触发 429
@@ -431,17 +452,21 @@ async def _resolve_quota_with_token_strategy(
         if firebase_blocked:
             raise RuntimeError("Firebase 全局限流中，无法刷新 token 查询额度，请稍后重试")
         token = await refresh_access_token_with_refresh_token(refresh_token)
+        refreshed_token = token
     else:
         raise RuntimeError("missing valid id_token and refresh_token")
 
     try:
-        return await get_request_limit_info(token)
+        quota = await get_request_limit_info(token)
+        return quota, refreshed_token
     except Exception as first_error:
         if from_id_token and refresh_token and _is_auth_error(first_error):
             if firebase_blocked:
                 raise RuntimeError("Firebase 全局限流中，无法刷新 token 重试额度查询") from first_error
-            refreshed_token = await refresh_access_token_with_refresh_token(refresh_token)
-            return await get_request_limit_info(refreshed_token)
+            token = await refresh_access_token_with_refresh_token(refresh_token)
+            refreshed_token = token
+            quota = await get_request_limit_info(token)
+            return quota, refreshed_token
         raise
 
 
@@ -496,11 +521,14 @@ async def batch_verify_quota() -> dict[str, Any]:
             continue
 
         try:
-            quota_info = await _resolve_quota_with_token_strategy(id_token, refresh_token)
+            quota_info, new_token = await _resolve_quota_with_token_strategy(id_token, refresh_token)
             total_limit = quota_info["request_limit"]
             used_limit = quota_info["used"]
 
             store.update_limit(account_id, total_limit, used_limit)
+            # 如果触发了 token 刷新，写回数据库
+            if new_token:
+                _save_refreshed_token(account_id, new_token)
             results["valid"] += 1
             results["details"].append({
                 "id": account_id,
@@ -575,11 +603,13 @@ async def verify_single_quota(account_id: int) -> dict[str, Any]:
         }
 
     try:
-        quota_info = await _resolve_quota_with_token_strategy(id_token, refresh_token)
+        quota_info, new_token = await _resolve_quota_with_token_strategy(id_token, refresh_token)
         total_limit = quota_info["request_limit"]
         used_limit = quota_info["used"]
 
         store.update_limit(account_id, total_limit, used_limit)
+        if new_token:
+            _save_refreshed_token(account_id, new_token)
 
         return {
             "success": True,
@@ -627,8 +657,7 @@ async def force_refresh_single(account_id: int) -> dict[str, Any]:
 
     try:
         from warp2protobuf.core.auth import refresh_access_token_with_refresh_token
-        result = await asyncio.to_thread(refresh_access_token_with_refresh_token, refresh_token)
-        new_id_token = result.get("id_token", "")
+        new_id_token = await refresh_access_token_with_refresh_token(refresh_token)
         if not new_id_token:
             return {"success": False, "detail": f"{email}: 刷新返回空 token"}
 
@@ -660,6 +689,34 @@ async def force_refresh_single(account_id: int) -> dict[str, Any]:
 class FeatureFlagsResponse(BaseModel):
     account_admin_enabled: bool
     account_register_enabled: bool
+
+
+@app.delete("/api/accounts/{account_id}", dependencies=[Depends(verify_admin_token)])
+async def delete_account(account_id: int) -> dict[str, Any]:
+    """删除单个账号。"""
+    if not ACCOUNT_ADMIN_ENABLED:
+        raise HTTPException(status_code=403, detail="Account management is disabled")
+    store = AccountStore(ACCOUNT_DB_PATH)
+    deleted = store.delete_account(account_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Account not found")
+    return {"success": True, "message": f"账号 #{account_id} 已删除"}
+
+
+class BatchDeleteRequest(BaseModel):
+    ids: list[int]
+
+
+@app.post("/api/accounts/batch-delete", dependencies=[Depends(verify_admin_token)])
+async def batch_delete_accounts(req: BatchDeleteRequest) -> dict[str, Any]:
+    """批量删除账号。"""
+    if not ACCOUNT_ADMIN_ENABLED:
+        raise HTTPException(status_code=403, detail="Account management is disabled")
+    if not req.ids:
+        raise HTTPException(status_code=400, detail="ids 不能为空")
+    store = AccountStore(ACCOUNT_DB_PATH)
+    count = store.batch_delete_accounts(req.ids)
+    return {"success": True, "message": f"已删除 {count} 个账号", "count": count}
 
 
 @app.get("/api/config", dependencies=[Depends(verify_admin_token)])

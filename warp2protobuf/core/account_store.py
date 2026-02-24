@@ -313,3 +313,29 @@ class AccountStore:
                 )
             conn.commit()
             return cursor.rowcount
+
+    def delete_account(self, account_id: int) -> bool:
+        """删除单个账号。"""
+        with sqlite3.connect(str(self.db_path)) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
+            conn.commit()
+            deleted = cursor.rowcount > 0
+            if deleted:
+                logger.info("Deleted account: id=%d", account_id)
+            return deleted
+
+    def batch_delete_accounts(self, account_ids: list[int]) -> int:
+        """批量删除账号，返回实际删除数量。"""
+        if not account_ids:
+            return 0
+        with sqlite3.connect(str(self.db_path)) as conn:
+            cursor = conn.cursor()
+            placeholders = ",".join("?" for _ in account_ids)
+            cursor.execute(
+                f"DELETE FROM accounts WHERE id IN ({placeholders})",
+                list(account_ids),
+            )
+            conn.commit()
+            logger.info("Batch deleted %d accounts", cursor.rowcount)
+            return cursor.rowcount

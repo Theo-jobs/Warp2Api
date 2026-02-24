@@ -23,9 +23,30 @@ _TOKEN_EXPIRY_BUFFER = 300
 # round_robin 全局游标
 _round_robin_cursor: int = 0
 
+# 运行时策略覆盖（None 表示使用环境变量配置）
+_runtime_strategy: Optional[str] = None
+
+
+def set_runtime_strategy(strategy: str) -> str:
+    """设置运行时策略覆盖，返回实际生效的策略名。"""
+    global _runtime_strategy
+    s = strategy.strip().lower()
+    if s not in VALID_STRATEGIES:
+        raise ValueError(f"未知策略 '{s}'，可选: {', '.join(VALID_STRATEGIES)}")
+    _runtime_strategy = s
+    logger.info("[AccountSelector] 运行时策略已切换为: %s", s)
+    return s
+
+
+def get_current_strategy() -> str:
+    """获取当前生效的策略名。"""
+    return _get_strategy()
+
 
 def _get_strategy() -> str:
-    """从 settings 获取当前策略，延迟导入避免循环依赖。"""
+    """获取当前策略：优先运行时覆盖，其次环境变量。"""
+    if _runtime_strategy is not None:
+        return _runtime_strategy
     try:
         from ..config.settings import ACCOUNT_SELECT_STRATEGY
         strategy = ACCOUNT_SELECT_STRATEGY.strip().lower()

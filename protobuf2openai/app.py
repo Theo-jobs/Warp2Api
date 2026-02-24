@@ -33,7 +33,12 @@ from warp2protobuf.config.settings import (
     ACCOUNT_SELECT_STRATEGY,
 )
 from warp2protobuf.core.account_store import AccountStore
-from warp2protobuf.core.account_selector import AccountSelector
+from warp2protobuf.core.account_selector import (
+    AccountSelector,
+    VALID_STRATEGIES,
+    set_runtime_strategy,
+    get_current_strategy,
+)
 
 # 记录启动时间
 _START_TIME = time.time()
@@ -618,7 +623,8 @@ async def get_feature_flags() -> dict[str, Any]:
                 account_admin_enabled=ACCOUNT_ADMIN_ENABLED,
                 account_register_enabled=ACCOUNT_REGISTER_ENABLED,
             ).model_dump(),
-            "account_select_strategy": ACCOUNT_SELECT_STRATEGY,
+            "account_select_strategy": get_current_strategy(),
+            "available_strategies": list(VALID_STRATEGIES),
         },
     }
 
@@ -701,7 +707,55 @@ async def manual_token_refresh():
     }
 
 
-@app.get("/api/system/stats", dependencies=[Depends(verify_admin_token)])
+class StrategyRequest(BaseModel):
+    strategy: str
+
+
+@app.put("/api/accounts/strategy", dependencies=[Depends(verify_admin_token)])
+async def change_strategy(req: StrategyRequest) -> dict[str, Any]:
+    """运行时切换账号选择策略。"""
+    if not ACCOUNT_ADMIN_ENABLED:
+        raise HTTPException(status_code=403, detail="Account management is disabled")
+    try:
+        actual = set_runtime_strategy(req.strategy)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {
+        "success": True,
+        "strategy": actual,
+        "available_strategies": list(VALID_STRATEGIES),
+    }
+
+
+@app.post("/api/accounts/reset-usage", dependencies=[Depends(verify_admin_token)])
+async def reset_account_usage() -> dict[str, Any]:
+    """重置所有账号的用量统计（use_count, used_limit, last_used）。"""
+    if not ACCOUNT_ADMIN_ENABLED:
+        raise HTTPException(status_code=403, detail="Account management is disabled")
+    store = AccountStore(ACCOUNT_DB_PATH)
+    count = store.reset_usage()
+    return {"success": True, "message": f"已重置 {count} 个账号的用量数据", "count": count}
+
+
+@app.post("/api/tokens/force-refresh", dependencies=[Depends(verify_admin_token)])
+async def force_token_refresh() -> dict[str, Any]:
+    """强制刷新 Token（清除 Firebase 限流标记后执行）。"""
+    if not ACCOUNT_ADMIN_ENABLED:
+        raise HTTPException(status_code=403, detail="Account management is disabled")
+    token_mgr = TokenManager.get_instance(ACCOUNT_DB_PATH)
+    # 清除 Firebase 限流标记
+    was_blocked = token_mgr.is_firebase_blocked()
+    token_mgr._firebase_blocked_until = 0.0
+    token_mgr._refresh_failures.clear()
+    logger.info("[ForceRefresh] Firebase 限流标记已清除 (was_blocked=%s)", was_blocked)
+    # 执行全量刷新
+    stats = await token_mgr.batch_refresh_all()
+    return {
+        "success": True,
+        "message": "强制刷新完成" + (" (已清除 Firebase 限流)" if was_blocked else ""),
+        "was_firebase_blocked": was_blocked,
+        "stats": stats,
+    }
 async def get_system_stats() -> dict[str, Any]:
     """获取系统监控信息"""
     try:

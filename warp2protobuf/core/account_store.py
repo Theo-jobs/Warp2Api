@@ -287,3 +287,29 @@ class AccountStore:
             )
             conn.commit()
             return cursor.rowcount
+
+    def reset_usage(self, account_ids: Optional[list[int]] = None) -> int:
+        """重置账号用量统计（use_count, used_limit, last_used）。
+
+        Args:
+            account_ids: 指定账号 ID 列表，为 None 则重置全部。
+
+        Returns:
+            实际更新的行数。
+        """
+        with sqlite3.connect(str(self.db_path)) as conn:
+            cursor = conn.cursor()
+            now = datetime.now().isoformat()
+            if account_ids:
+                placeholders = ",".join("?" for _ in account_ids)
+                cursor.execute(
+                    f"UPDATE accounts SET use_count = 0, used_limit = 0, last_used = NULL, updated_at = ? WHERE id IN ({placeholders})",
+                    [now] + list(account_ids),
+                )
+            else:
+                cursor.execute(
+                    "UPDATE accounts SET use_count = 0, used_limit = 0, last_used = NULL, updated_at = ?",
+                    (now,),
+                )
+            conn.commit()
+            return cursor.rowcount

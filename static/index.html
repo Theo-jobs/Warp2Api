@@ -286,8 +286,14 @@
             </div>
             <div class="card">
                 <div class="card-title">选择策略</div>
-                <div class="card-value" id="select-strategy" style="font-size: 16px;">-</div>
-                <div class="card-subtitle" id="strategy-desc">-</div>
+                <select id="select-strategy" onchange="changeStrategy(this.value)" style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 6px; font-size: 14px; margin-top: 4px; cursor: pointer;">
+                    <option value="least_used">最少使用优先</option>
+                    <option value="round_robin">轮询</option>
+                    <option value="random">随机</option>
+                    <option value="most_quota">最多额度优先</option>
+                    <option value="priority">优先级</option>
+                </select>
+                <div class="card-subtitle" id="strategy-desc" style="margin-top: 6px;">-</div>
             </div>
         </div>
 
@@ -309,6 +315,8 @@
             <button onclick="loadAccounts()">🔍 搜索</button>
             <button onclick="loadSummary()">🔄 刷新</button>
             <button onclick="batchRefreshQuota()" class="btn-warning" id="btn-verify">🔍 批量检查额度</button>
+            <button onclick="forceRefreshTokens()" class="btn-warning" id="btn-force-refresh" title="清除 Firebase 限流标记并强制刷新所有 Token">⚡ 强制刷新Token</button>
+            <button onclick="resetAllUsage()" class="btn-secondary" id="btn-reset-usage" title="重置所有账号的使用次数和已用额度">🔄 重置用量</button>
             <button onclick="window.open('/test', '_blank')" class="btn-success" id="btn-anthropic-test">🧪 Anthropic 测试页</button>
             <button onclick="showRegisterModal()" class="btn-secondary" id="btn-register" disabled title="自动注册功能已暂缓">➕ 注册新账号（已暂缓）</button>
         </div>
@@ -502,15 +510,8 @@
                         `额度耗尽: ${pool.exhausted}`;
 
                     const strategy = pool.strategy || 'least_used';
-                    const strategyNames = {
-                        'least_used': '最少使用优先',
-                        'round_robin': '轮询',
-                        'random': '随机',
-                        'most_quota': '最多额度优先',
-                        'priority': '优先级'
-                    };
-                    document.getElementById('select-strategy').textContent = strategyNames[strategy] || strategy;
-                    document.getElementById('strategy-desc').textContent = `ACCOUNT_SELECT_STRATEGY=${strategy}`;
+                    document.getElementById('select-strategy').value = strategy;
+                    document.getElementById('strategy-desc').textContent = `当前: ${strategy}`;
                 }
 
                 // 显示最近使用的账号
@@ -1032,6 +1033,66 @@
             document.querySelectorAll('.row-checkbox').forEach(cb => { cb.checked = false; });
             document.getElementById('select-all').checked = false;
             updateBatchBar();
+        }
+
+        async function changeStrategy(strategy) {
+            try {
+                const resp = await authFetch('/api/accounts/strategy', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ strategy })
+                });
+                const data = await resp.json();
+                if (data.success) {
+                    document.getElementById('strategy-desc').textContent = `已切换: ${data.strategy}`;
+                    showError('策略已切换为: ' + data.strategy);
+                } else {
+                    showError('切换失败: ' + (data.detail || '未知错误'));
+                }
+            } catch (e) {
+                showError('切换策略失败: ' + e.message);
+            }
+        }
+
+        async function forceRefreshTokens() {
+            if (!confirm('将清除 Firebase 限流标记并强制刷新所有账号 Token，确认？')) return;
+            const btn = document.getElementById('btn-force-refresh');
+            btn.disabled = true;
+            btn.textContent = '⏳ 刷新中...';
+            try {
+                const resp = await authFetch('/api/tokens/force-refresh', { method: 'POST' });
+                const data = await resp.json();
+                if (data.success) {
+                    const s = data.stats || {};
+                    alert(`${data.message}\n成功: ${s.refreshed || 0}\n失败: ${s.failed || 0}\n跳过: ${s.skipped || 0}`);
+                    loadSummary();
+                    loadAccounts(currentPage);
+                } else {
+                    showError('强制刷新失败: ' + (data.detail || '未知错误'));
+                }
+            } catch (e) {
+                showError('强制刷新失败: ' + e.message);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '⚡ 强制刷新Token';
+            }
+        }
+
+        async function resetAllUsage() {
+            if (!confirm('将重置所有账号的使用次数和已用额度为 0，确认？')) return;
+            try {
+                const resp = await authFetch('/api/accounts/reset-usage', { method: 'POST' });
+                const data = await resp.json();
+                if (data.success) {
+                    alert(data.message);
+                    loadSummary();
+                    loadAccounts(currentPage);
+                } else {
+                    showError('重置失败: ' + (data.detail || '未知错误'));
+                }
+            } catch (e) {
+                showError('重置用量失败: ' + e.message);
+            }
         }
 
         async function batchUpdateStatus(newStatus) {

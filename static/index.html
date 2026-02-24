@@ -62,8 +62,18 @@
             width: 100%;
             background: white;
             border-radius: 8px;
-            overflow: hidden;
             box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .table-wrap {
+            width: 100%;
+            overflow-x: auto;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .table-wrap table {
+            box-shadow: none;
+            border-radius: 0;
+            min-width: 1100px;
         }
         th, td {
             padding: 12px;
@@ -356,6 +366,7 @@
 
         <h2 style="color: #333; margin-bottom: 15px; font-size: 18px;">所有账号</h2>
 
+        <div class="table-wrap">
         <table id="accounts-table" style="display: none;">
             <thead>
                 <tr>
@@ -373,6 +384,7 @@
             </thead>
             <tbody id="accounts-body"></tbody>
         </table>
+        </div>
 
         <div class="pagination" id="pagination" style="display: none;"></div>
 

@@ -42,7 +42,7 @@ class AccountContext:
     def __exit__(self, exc_type, exc_val, exc_tb):
         """退出上下文：记录使用"""
         if self.account:
-            self.selector.record_usage(self.account["id"], self.tokens_used)
+            self.selector.record_usage(self.account["id"], 1)
             logger.info(
                 "[AccountContext] Released account: id=%d tokens=%d",
                 self.account["id"],

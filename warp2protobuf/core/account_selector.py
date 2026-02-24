@@ -220,8 +220,8 @@ class AccountSelector:
             )
             return account
 
-    def record_usage(self, account_id: int, tokens_used: int = 0) -> bool:
-        """记录账号使用。"""
+    def record_usage(self, account_id: int, request_count: int = 1) -> bool:
+        """记录账号使用（按请求次数递增 used_limit，与 Warp 的 request_limit 单位一致）。"""
         with sqlite3.connect(str(self.db_path)) as conn:
             cursor = conn.cursor()
             now = datetime.now().isoformat()
@@ -232,13 +232,13 @@ class AccountSelector:
                     last_used = ?,
                     updated_at = ?
                 WHERE id = ?
-            """, (tokens_used, now, now, account_id))
+            """, (request_count, now, now, account_id))
             conn.commit()
             success = cursor.rowcount > 0
             if success:
                 logger.info(
-                    "[AccountSelector] Recorded usage: account_id=%d tokens=%d",
-                    account_id, tokens_used,
+                    "[AccountSelector] Recorded usage: account_id=%d requests=+%d",
+                    account_id, request_count,
                 )
             else:
                 logger.warning(

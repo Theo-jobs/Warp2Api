@@ -1,432 +1,201 @@
 # Warp2Api
 
-基于 Python 的桥接服务，为 Warp AI 服务提供 OpenAI Chat Completions API 兼容性，通过利用 Warp 的 protobuf 基础架构，实现与 OpenAI 兼容应用程序的无缝集成。
+将 Warp AI 服务转换为标准 Anthropic Messages API，支持多账号池、自动 Token 管理、额度追踪与 Web 管理界面。
 
-## 🚀 特性
+## 特性
 
-- **OpenAI API 兼容性**: 完全支持 OpenAI Chat Completions API 格式
-- **Warp 集成**: 使用 protobuf 通信与 Warp AI 服务无缝桥接
-- **双服务器架构**: 
-  - 用于 Warp 通信的 Protobuf 编解码服务器
-  - 用于客户端应用程序的 OpenAI 兼容 API 服务器
-- **JWT 认证**: Warp 服务的自动令牌管理和刷新
-- **流式支持**: 与 OpenAI SSE 格式兼容的实时流式响应
-- **WebSocket 监控**: 内置监控和调试功能
-- **消息重排序**: 针对 Anthropic 风格对话的智能消息处理
+- **Anthropic Messages API 兼容** — 对外暴露 `/v1/messages`，可直接对接 Claude Code、Cursor 等工具
+- **多账号池管理** — SQLite 存储，支持 5 种选择策略（least_used / round_robin / random / most_quota / priority）
+- **自动 Token 生命周期** — 后台预刷新、Firebase 429 全局冷却、JWT 过期双重校验
+- **额度实时追踪** — GraphQL 查询 Warp 真实额度，额度归零自动标记 exhausted，恢复后自动启用
+- **Rust TLS 指纹代理** — rustls 模拟 Warp 桌面客户端 JA3/JA4 指纹，规避 403
+- **Bridge 429 防护** — 全局信号量 + 冷却窗口 + 排队等待，避免并发打爆
+- **Web 管理 GUI** — 账号增删改查、批量操作、额度检查、排序筛选
+- **Docker 一键部署** — 多阶段构建，持久卷挂载数据库，零停机更新
+- **流式响应** — SSE 流式输出，支持 extended thinking
 
-## 📋 系统要求
+## 架构
 
-- Python 3.9+ (推荐 3.13+)
-- Warp AI 服务访问权限（JWT 令牌会自动获取）
-- 支持 Linux、macOS 和 Windows
+```
+客户端 (Claude Code / Cursor / ...)
+    │
+    ▼
+┌──────────────────────────────┐
+│  OpenAI/Anthropic API Server │  ← port 28889 (FastAPI)
+│  /v1/messages  /v1/models    │
+│  /gui  /api/accounts/*       │
+└──────────┬───────────────────┘
+           │
+           ▼
+┌──────────────────────────────┐
+│  Protobuf Bridge Server      │  ← port 28888 (FastAPI)
+│  JSON ↔ Protobuf 编解码      │
+│  GraphQL 代理 / Auth 管理     │
+└──────────┬───────────────────┘
+           │
+           ▼
+┌──────────────────────────────┐
+│  Rust TLS Proxy (rustls)     │  ← port 28887
+│  JA3/JA4 指纹伪装            │
+└──────────┬───────────────────┘
+           │
+           ▼
+      Warp AI 服务
+```
 
-## 🛠️ 安装
+## 支持模型
 
-1. **克隆仓库:**
-   ```bash
-   git clone <repository-url>
-   cd Warp2Api
-   ```
+| 系列 | 模型 |
+|------|------|
+| Anthropic Claude | `claude-4-sonnet`, `claude-4-opus`, `claude-4.1-opus`, `claude-4-5-haiku`, `claude-4-5-sonnet`, `claude-4-5-opus`, `claude-4-6-sonnet-high/max`, `claude-4-6-opus-high/max` (含 thinking 变体) |
+| OpenAI GPT | `gpt-4o`, `gpt-4.1`, `gpt-5`, `gpt-5-1-*`, `gpt-5-2-*`, `gpt-5-3-codex-*` |
+| OpenAI o-series | `o3`, `o4-mini` |
+| Google Gemini | `gemini-2.5-pro`, `gemini-3-pro` |
+| GLM (智谱) | `glm-47-fireworks` |
+| Auto | `auto`, `auto-efficient`, `auto-genius` |
 
-2. **使用 uv 安装依赖 (推荐):**
-   ```bash
-   uv sync
-   ```
+支持 Anthropic 标准名（如 `claude-opus-4-6-20260205`）和简写别名自动映射。
 
-   或使用 pip:
-   ```bash
-   pip install -e .
-   ```
+## 快速开始
 
-3. **配置环境变量:**
-    程序会自动获取匿名JWT TOKEN，您无需手动配置。
+### Docker 部署（推荐）
 
-    如需自定义配置，可以创建 `.env` 文件:
-    ```env
-    # Warp2Api 配置
-    # 设置为 true 启用详细日志输出，默认 false（静默模式）
-    W2A_VERBOSE=false
-
-    # Bridge服务器URL配置 - 修复端口配置问题
-    WARP_BRIDGE_URL=http://127.0.0.1:28888
-
-    # 禁用代理以避免连接问题
-    HTTP_PROXY=
-    HTTPS_PROXY=
-    NO_PROXY=127.0.0.1,localhost
-
-    # 可选：使用自己的Warp凭证（不推荐，会消耗订阅额度）
-    WARP_JWT=your_jwt_token_here
-    WARP_REFRESH_TOKEN=your_refresh_token_here
-    ```
-
-## 🎯 使用方法
-
-### 快速开始
-
-#### 方法一：一键启动脚本（推荐）
-
-**Linux/macOS:**
 ```bash
-# 启动所有服务器
+# 1. 克隆仓库
+git clone <repository-url>
+cd Warp2Api
+
+# 2. 配置环境变量
+cp .env.example .env
+# 编辑 .env，设置 WARP_REFRESH_TOKEN 和 API_TOKEN
+
+# 3. 构建并启动
+docker compose up -d
+
+# 4. 验证
+curl http://localhost:28889/healthz
+```
+
+### 极空间 NAS 部署
+
+```bash
+# 一键部署（含代码同步、构建、启动、健康检查）
+./deploy.sh
+```
+
+数据库持久化在 `${COMPOSE_DIR}/data/accounts.db`，不随镜像重建丢失。
+
+### 本地开发
+
+```bash
+# 安装依赖
+pip install -e .
+
+# 启动（Linux/macOS）
 ./start.sh
 
-# 停止所有服务器
-./stop.sh
-
-# 查看服务器状态
-./stop.sh status
+# 或手动启动
+python server.py          # Protobuf Bridge (port 28888)
+python openai_compat.py   # API Server (port 28889)
 ```
 
-**Windows:**
-```batch
-REM 使用批处理脚本
-start.bat          # 启动服务器
-stop.bat           # 停止服务器
-stop.bat status    # 查看服务器状态
-test.bat           # 测试API接口功能
+## 配置
 
-REM 或使用 PowerShell 脚本
-.\start.ps1        # 启动服务器
-.\start.ps1 -Stop  # 停止服务器
-.\start.ps1 -Verbose  # 启用详细日志
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `API_TOKEN` | `001` | API 认证 Bearer Token |
+| `WARP_REFRESH_TOKEN` | — | Warp 刷新令牌（必填） |
+| `WARP_BRIDGE_URL` | `http://127.0.0.1:28888` | Bridge 服务地址 |
+| `ACCOUNT_DB_PATH` | `./accounts.db` | SQLite 数据库路径 |
+| `ACCOUNT_ADMIN_ENABLED` | `true` | 启用账号管理 API |
+| `ACCOUNT_SELECT_STRATEGY` | `least_used` | 账号选择策略 |
+| `ACCOUNT_REGISTER_ENABLED` | `false` | 启用批量注册 |
+| `WARP_RUSTLS_PROXY` | `1` | 启用 Rust TLS 代理 |
+| `RUST_PROXY_PORT` | `28887` | Rust 代理端口 |
+| `W2A_VERBOSE` | `false` | 详细日志 |
+| `WARP_PROXY_URL` | — | Warp 请求 HTTP 代理 |
 
-REM 测试脚本
-test.bat           # 测试API接口功能（静默模式）
-test.bat -v        # 测试API接口功能（详细模式）
-```
+## 使用
 
-启动脚本会自动：
-- ✅ 检查Python环境和依赖
-- ✅ 自动配置环境变量（包括API_TOKEN自动设置为"0000"）
-- ✅ 按正确顺序启动两个服务器
-- ✅ 验证服务器健康状态（循环检查healthz端点）
-- ✅ 显示关键配置信息
-- ✅ 显示完整的 API 接口 Token
-- ✅ 显示 Roocode / KiloCode baseUrl
-- ✅ 实时监控服务器日志（verbose模式）
-- ✅ 提供详细的错误处理和状态反馈
+### Anthropic SDK (Python)
 
-### 📸 运行演示
-
-#### 项目启动界面
-![项目启动界面](docs/screenshots/运行截图.png)
-
-#### 使用示例
-![使用示例](docs/screenshots/使用截图.png)
-
-#### 方法二：手动启动
-
-1. **启动 Protobuf 桥接服务器:**
-   ```bash
-   python server.py
-   ```
-   默认地址: `http://localhost:28888`
-
-2. **启动 OpenAI 兼容 API 服务器:**
-   ```bash
-   python openai_compat.py
-   ```
-   默认地址: `http://localhost:28889`
-
-### 支持的模型
-
-Warp2Api 支持以下 AI 模型：
-
-#### Anthropic Claude 系列
-- `claude-4-sonnet` - Claude 4 Sonnet 模型
-- `claude-4-opus` - Claude 4 Opus 模型
-- `claude-4.1-opus` - Claude 4.1 Opus 模型
-
-#### Google Gemini 系列
-- `gemini-2.5-pro` - Gemini 2.5 Pro 模型
-
-#### OpenAI GPT 系列
-- `gpt-4.1` - GPT-4.1 模型
-- `gpt-4o` - GPT-4o 模型
-- `gpt-5` - GPT-5 基础模型
-- `gpt-5 (high reasoning)` - GPT-5 高推理模式
-
-#### OpenAI o系列
-- `o3` - o3 模型
-- `o4-mini` - o4-mini 模型
-
-### 使用 API
-
-#### 🔓 认证说明
-**重要：Warp2Api 的 OpenAI 兼容接口不需要 API key 验证！**
-
-- 服务器会自动处理 Warp 服务的认证
-- 客户端可以发送任意的 `api_key` 值（或完全省略）
-- 所有请求都会使用系统自动获取的匿名 JWT token
-
-两个服务器都运行后，您可以使用任何 OpenAI 兼容的客户端:
-
-#### Python 示例
 ```python
-import openai
+import anthropic
 
-client = openai.OpenAI(
-    base_url="http://localhost:28889/v1",
-    api_key="dummy"  # 可选：某些客户端需要，但服务器不强制验证
+client = anthropic.Anthropic(
+    base_url="http://localhost:28889",
+    api_key="your-api-token",
 )
 
-response = client.chat.completions.create(
-    model="claude-4-sonnet",  # 选择支持的模型
-    messages=[
-        {"role": "user", "content": "你好，你好吗？"}
-    ],
-    stream=True
+message = client.messages.create(
+    model="claude-4-sonnet",
+    max_tokens=4096,
+    messages=[{"role": "user", "content": "Hello"}],
 )
-
-for chunk in response:
-    if chunk.choices[0].delta.content:
-        print(chunk.choices[0].delta.content, end="")
+print(message.content[0].text)
 ```
 
-#### cURL 示例
+### cURL
+
 ```bash
-# 基本请求
-curl -X POST http://localhost:28889/v1/chat/completions \
+curl -X POST http://localhost:28889/v1/messages \
   -H "Content-Type: application/json" \
+  -H "x-api-key: your-api-token" \
+  -H "anthropic-version: 2023-06-01" \
   -d '{
     "model": "claude-4-sonnet",
-    "messages": [
-      {"role": "user", "content": "你好，请介绍一下你自己"}
-    ],
+    "max_tokens": 4096,
+    "messages": [{"role": "user", "content": "Hello"}],
     "stream": true
   }'
-
-# 指定其他模型
-curl -X POST http://localhost:28889/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-5",
-    "messages": [
-      {"role": "user", "content": "解释量子计算的基本原理"}
-    ],
-    "temperature": 0.7,
-    "max_tokens": 1000
-  }'
 ```
 
-#### JavaScript/Node.js 示例
-```javascript
-const OpenAI = require('openai');
-
-const client = new OpenAI({
-  baseURL: 'http://localhost:28889/v1',
-  apiKey: 'dummy'  // 可选：某些客户端需要，但服务器不强制验证
-});
-
-async function main() {
-  const completion = await client.chat.completions.create({
-    model: 'gemini-2.5-pro',
-    messages: [
-      { role: 'user', content: '写一个简单的Hello World程序' }
-    ],
-    stream: true
-  });
-
-  for await (const chunk of completion) {
-    process.stdout.write(chunk.choices[0]?.delta?.content || '');
-  }
-}
-
-main();
-```
-
-### 模型选择建议
-
-- **编程任务**: 推荐使用 `claude-4-sonnet` 或 `gpt-5`
-- **创意写作**: 推荐使用 `claude-4-opus` 或 `gpt-4o`
-- **代码审查**: 推荐使用 `claude-4.1-opus`
-- **推理任务**: 推荐使用 `gpt-5 (high reasoning)` 或 `o3`
-- **轻量任务**: 推荐使用 `o4-mini` 或 `gpt-4o`
-
-### 可用端点
-
-#### Protobuf 桥接服务器 (`http://localhost:28888`)
-- `GET /healthz` - 健康检查
-- `POST /encode` - 将 JSON 编码为 protobuf
-- `POST /decode` - 将 protobuf 解码为 JSON
-- `WebSocket /ws` - 实时监控
-
-#### OpenAI API 服务器 (`http://localhost:28889`)
-- `GET /` - 服务状态
-- `GET /healthz` - 健康检查
-- `POST /v1/chat/completions` - OpenAI Chat Completions 兼容端点
-
-## 🏗️ 架构
-
-```
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│    客户端应用     │───▶│  OpenAI API     │───▶│   Protobuf      │
-│  (OpenAI SDK)   │    │     服务器      │    │    桥接服务器    │
-└─────────────────┘    │  (端口 28889)   │    │  (端口 28888)   │
-                        └─────────────────┘    └─────────────────┘
-                                                        │
-                                                        ▼
-                                               ┌─────────────────┐
-                                               │    Warp AI      │
-                                               │      服务       │
-                                               └─────────────────┘
-```
-
-### 核心组件
-
-- **`protobuf2openai/`**: OpenAI API 兼容层
-  - 消息格式转换
-  - 流式响应处理
-  - 错误映射和验证
-
-- **`warp2protobuf/`**: Warp protobuf 通信层
-  - JWT 认证管理
-  - Protobuf 编解码
-  - WebSocket 监控
-  - 请求路由和验证
-
-## 🔧 配置
-
-### 环境变量
-
-| 变量 | 描述 | 默认值 |
-|------|------|--------|
-| `WARP_JWT` | Warp 认证 JWT 令牌 | 自动获取 |
-| `WARP_REFRESH_TOKEN` | JWT 刷新令牌 | 可选 |
-| `WARP_BRIDGE_URL` | Protobuf 桥接服务器 URL | `http://127.0.0.1:28888` |
-| `HTTP_PROXY` | HTTP 代理设置 | 空（禁用代理） |
-| `HTTPS_PROXY` | HTTPS 代理设置 | 空（禁用代理） |
-| `NO_PROXY` | 不使用代理的主机 | `127.0.0.1,localhost` |
-| `HOST` | 服务器主机地址 | `127.0.0.1` |
-| `PORT` | OpenAI API 服务器端口 | `28889` |
-| `API_TOKEN` | API接口认证令牌 | `0000`（自动设置） |
-| `W2A_VERBOSE` | 启用详细日志输出 | `false` |
-
-### 项目脚本
-
-在 `pyproject.toml` 中定义:
+### Claude Code
 
 ```bash
-# 启动 protobuf 桥接服务器
-warp-server
-
-# 启动 OpenAI API 服务器  
-warp-test
+export ANTHROPIC_BASE_URL=http://localhost:28889
+export ANTHROPIC_API_KEY=your-api-token
+claude
 ```
 
-## 🔐 认证
+## 管理界面
 
-服务会自动处理 Warp 认证:
+访问 `http://localhost:28889/gui` 打开 Web 管理面板：
 
-1. **JWT 管理**: 自动令牌验证和刷新
-2. **匿名访问**: 在需要时回退到匿名令牌
-3. **令牌持久化**: 安全的令牌存储和重用
+- 账号列表：状态、额度、使用次数、排序筛选
+- 批量操作：启用/禁用/删除/重置用量
+- 额度检查：单个或批量查询 Warp 真实额度
+- Token 刷新：手动或强制刷新
+- 策略切换：运行时切换账号选择策略
 
-## 🧪 开发
-
-### 项目结构
+## 项目结构
 
 ```
 Warp2Api/
-├── protobuf2openai/          # OpenAI API 兼容层
-│   ├── app.py               # FastAPI 应用程序
-│   ├── router.py            # API 路由
-│   ├── models.py            # Pydantic 模型
-│   ├── bridge.py            # 桥接初始化
-│   └── sse_transform.py     # 服务器发送事件
-├── warp2protobuf/           # Warp protobuf 层
-│   ├── api/                 # API 路由
-│   ├── core/                # 核心功能
-│   │   ├── auth.py          # 认证
-│   │   ├── protobuf_utils.py # Protobuf 工具
-│   │   └── logging.py       # 日志设置
-│   ├── config/              # 配置
-│   └── warp/                # Warp 特定代码
-├── server.py                # Protobuf 桥接服务器
-├── openai_compat.py         # OpenAI API 服务器
-├── start.sh                 # Linux/macOS 启动脚本
-├── stop.sh                  # Linux/macOS 停止脚本
-├── test.sh                  # Linux/macOS 测试脚本
-├── start.bat                # Windows 批处理启动脚本
-├── stop.bat                 # Windows 批处理停止脚本
-├── test.bat                 # Windows 批处理测试脚本
-├── start.ps1                # Windows PowerShell 启动脚本
-├── docs/                    # 项目文档
-│   ├── TROUBLESHOOTING.md   # 故障排除指南
-│   └── screenshots/         # 项目截图
-└── pyproject.toml           # 项目配置
+├── server.py                # Protobuf Bridge 入口
+├── openai_compat.py         # API Server 入口
+├── docker-entrypoint.sh     # 容器启动脚本（3 进程）
+├── deploy.sh                # 极空间一键部署
+├── protobuf2openai/         # API 兼容层
+│   ├── app.py               # FastAPI 主应用 + 账号管理 API
+│   ├── anthropic_router.py  # /v1/messages 路由 + 429 防护
+│   ├── anthropic_sse.py     # Anthropic SSE 流式转换
+│   ├── token_manager.py     # Token 生命周期 + 后台刷新 + 额度同步
+│   └── auth.py              # Bearer Token 认证
+├── warp2protobuf/           # Warp 协议层
+│   ├── core/
+│   │   ├── account_store.py    # SQLite CRUD
+│   │   ├── account_selector.py # 5 种选择策略
+│   │   ├── quota.py            # GraphQL 额度查询
+│   │   └── auth.py             # Firebase JWT 管理
+│   └── config/
+│       ├── settings.py         # 环境变量配置
+│       └── models.py           # 模型目录 + 别名映射
+├── rust-proxy/              # Rust TLS 指纹代理
+├── static/index.html        # Web 管理 GUI
+└── tools/                   # 工具脚本
 ```
 
-### 截图演示
+## 许可证
 
-项目运行截图和界面演示请查看 [`docs/screenshots/`](docs/screenshots/) 文件夹。
-
-## 📋 文档
-
-主要依赖项包括:
-- **FastAPI**: 现代、快速的 Web 框架
-- **Uvicorn**: ASGI 服务器实现
-- **HTTPx**: 支持 HTTP/2 的异步 HTTP 客户端
-- **Protobuf**: Protocol buffer 支持
-- **WebSockets**: WebSocket 通信
-- **OpenAI**: 用于类型兼容性
-
-## 🐛 故障排除
-
-详细的故障排除指南请参考 [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md)
-
-### 常见问题
-
-1. **"Server disconnected without sending a response" 错误**
-    - 检查 `.env` 文件中的 `WARP_BRIDGE_URL` 配置是否正确
-    - 确保代理设置已禁用：`HTTP_PROXY=`, `HTTPS_PROXY=`, `NO_PROXY=127.0.0.1,localhost`
-    - 验证桥接服务器是否在端口 28888 上运行
-    - 检查防火墙是否阻止了本地连接
-
-2. **JWT 令牌过期**
-    - 服务会自动刷新令牌
-    - 检查日志中的认证错误
-    - 验证 `WARP_REFRESH_TOKEN` 是否有效
-
-3. **桥接服务器未就绪**
-    - 确保首先运行 protobuf 桥接服务器
-    - 检查 `WARP_BRIDGE_URL` 配置（应为 `http://127.0.0.1:28888`）
-    - 验证端口可用性
-
-4. **代理连接错误**
-    - 如果遇到 `ProxyError` 或端口 1082 错误
-    - 在 `.env` 文件中设置：`HTTP_PROXY=`, `HTTPS_PROXY=`, `NO_PROXY=127.0.0.1,localhost`
-    - 或者在系统环境中禁用代理
-
-5. **连接错误**
-    - 检查到 Warp 服务的网络连接
-    - 验证防火墙设置
-    - 确保本地端口 28888 和 28889 未被其他应用占用
-
-### 日志记录
-
-两个服务器都提供详细的日志记录:
-- 认证状态和令牌刷新
-- 请求/响应处理
-- 错误详情和堆栈跟踪
-- 性能指标
-
-## 📄 许可证
-
-该项目配置为内部使用。请与项目维护者联系了解许可条款。
-
-## 🤝 贡献
-
-1. Fork 仓库
-2. 创建功能分支
-3. 进行更改
-4. 如适用，添加测试
-5. 提交 pull request
-
-## 📞 支持
-
-如有问题和疑问:
-1. 查看故障排除部分
-2. 查看服务器日志获取错误详情
-3. 创建包含重现步骤的 issue
+仅供个人学习研究使用。

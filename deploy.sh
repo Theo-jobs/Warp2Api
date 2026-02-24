@@ -84,6 +84,7 @@ fi
 
 # ========== Step 3: 生成并上传 docker-compose.yml ==========
 log "Step 3/7: 生成 docker-compose.yml..."
+run_sudo "mkdir -p ${COMPOSE_DIR}/data"
 TMPFILE=$(mktemp)
 trap 'rm -f "$TMPFILE"' EXIT
 cat > "$TMPFILE" <<DEOF
@@ -102,7 +103,9 @@ services:
     environment:
       - TZ=Asia/Shanghai
       - NO_PROXY=127.0.0.1,localhost
+      - ACCOUNT_DB_PATH=/app/data/accounts.db
     volumes:
+      - ${COMPOSE_DIR}/data:/app/data
       - warp2api-logs:/app/logs
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://127.0.0.1:${CONTAINER_PORT}/healthz"]
@@ -138,6 +141,15 @@ log "新镜像构建成功"
 log "Step 5/7: 切换容器（停旧启新）..."
 run_sudo "cd ${COMPOSE_DIR} && docker compose down --remove-orphans 2>/dev/null; echo done" || true
 run_sudo "cd ${COMPOSE_DIR} && docker compose up -d" || err "容器启动失败"
+# 如果持久卷中没有 accounts.db，从备份恢复（首次迁移到持久卷时）
+DB_EXISTS=$(run_sudo "test -s ${COMPOSE_DIR}/data/accounts.db && echo yes || echo no" || echo "no")
+DB_EXISTS=$(echo "$DB_EXISTS" | grep -oE '(yes|no)' | tail -1)
+if [ "$DB_EXISTS" = "no" ] && run_sudo "test -f /tmp/accounts.db && echo yes" 2>/dev/null | grep -q yes; then
+    info "持久目录中无数据库，从备份恢复..."
+    run_sudo "cp /tmp/accounts.db ${COMPOSE_DIR}/data/accounts.db"
+    run_sudo "docker restart ${CONTAINER_NAME}"
+    log "数据库已恢复到持久目录"
+fi
 log "新容器已启动"
 
 # ========== Step 6: 清理旧镜像 ==========

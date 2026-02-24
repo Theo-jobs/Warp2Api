@@ -424,7 +424,7 @@ async def chat_completions(req: ChatCompletionsRequest, request: Request = None)
         request_cost = bridge_resp.get("request_cost", 0)
         if isinstance(request_cost, (int, float)) and request_cost > 0:
             tokens_used = int(request_cost)
-            selector.record_usage(account_id, tokens_used)
+            selector.record_usage(account_id, 1)
             logger.info(
                 "[OpenAI Compat] Request cost: %d tokens, account_id=%d",
                 tokens_used,

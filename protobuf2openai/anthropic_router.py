@@ -795,7 +795,7 @@ async def anthropic_messages(request: Request) -> Any:
                             yield buf
                         # 用真实 token 数记录使用
                         total_tokens = _input_tokens + _output_tokens
-                        selector.record_usage(_stream_account_id, max(1, total_tokens))
+                        selector.record_usage(_stream_account_id, 1)
                         logger.info(
                             "[Anthropic] stream done: account_id=%d input=%d output=%d total=%d",
                             _stream_account_id, _input_tokens, _output_tokens, total_tokens,
@@ -885,7 +885,7 @@ async def anthropic_messages(request: Request) -> Any:
     # 从非流式响应中提取真实 token 统计
     usage = final_payload.get("usage", {})
     total_tokens = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
-    selector.record_usage(account_id, max(1, total_tokens))
+    selector.record_usage(account_id, 1)
     logger.info(
         "[Anthropic] non-stream done: account_id=%d input=%d output=%d total=%d",
         account_id, usage.get("input_tokens", 0), usage.get("output_tokens", 0), total_tokens,

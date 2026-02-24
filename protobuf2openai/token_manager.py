@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import random
 import sqlite3
 import time
 from datetime import datetime
@@ -25,8 +26,12 @@ from warp2protobuf.core.logging import logger
 
 # Token 有效期常量（Firebase id_token = 60 分钟）
 TOKEN_LIFETIME_SECONDS = 3600
-# 提前多少秒开始预刷新（提前 10 分钟）
-PRE_REFRESH_BUFFER_SECONDS = 600
+# 提前多少秒开始预刷新（缩短到 3 分钟，减少不必要的刷新）
+PRE_REFRESH_BUFFER_SECONDS = 180
+# 活跃账号窗口：仅预刷新最近 2 小时内使用过的账号
+ACTIVE_ACCOUNT_WINDOW_SECONDS = 7200
+# Jitter 最大偏移（秒），防止雷群效应
+MAX_JITTER_SECONDS = 120
 
 
 class TokenManager:
@@ -302,7 +307,7 @@ class TokenManager:
             return
         self._refresh_task = asyncio.create_task(self._background_refresh_loop())
         logger.info(
-            "[TokenManager] ✅ 后台预刷新已启动（每 5 分钟检查，到期前 %d 分钟刷新）",
+            "[TokenManager] ✅ 后台预刷新已启动（动态间隔，到期前 %d 分钟刷新，仅刷新活跃账号）",
             PRE_REFRESH_BUFFER_SECONDS // 60,
         )
 
@@ -320,26 +325,37 @@ class TokenManager:
             await asyncio.sleep(next_interval)
 
     async def _refresh_expiring_tokens(self) -> int:
-        """扫描即将过期的 token（10 分钟内到期），逐个刷新。
+        """扫描即将过期的活跃账号 token，逐个刷新。
+
+        优化策略：
+        1. 仅刷新最近 2 小时内使用过的账号（活跃账号追踪）
+        2. 预刷新窗口缩短到 3 分钟（减少不必要刷新）
+        3. 每个账号加随机 Jitter（防雷群效应）
 
         Returns:
             建议的下次检查间隔（秒）。
         """
         if self.is_firebase_blocked():
             logger.debug("[TokenManager] Firebase 限流中，跳过预刷新")
-            return 300  # 限流期间 5 分钟后再查
+            return 300
 
-        threshold = time.time() + PRE_REFRESH_BUFFER_SECONDS
+        now = time.time()
+        threshold = now + PRE_REFRESH_BUFFER_SECONDS
+        active_since = now - ACTIVE_ACCOUNT_WINDOW_SECONDS
+
         with sqlite3.connect(str(self.db_path)) as conn:
             conn.row_factory = sqlite3.Row
-            # 查找 token_expires_at 在阈值内 或 为 0（未记录）且 token 存在的账号
+            # 仅查询活跃账号（last_used 在 2 小时内）且即将过期的
             rows = conn.execute(
                 """
-                SELECT id, email, id_token, refresh_token, token_expires_at
+                SELECT id, email, id_token, refresh_token, token_expires_at, last_used
                 FROM accounts
                 WHERE status = 'available'
                   AND refresh_token IS NOT NULL
                   AND refresh_token != ''
+                  AND (
+                    last_used IS NOT NULL AND last_used > ?
+                  )
                   AND (
                     (token_expires_at > 0 AND token_expires_at < ?)
                     OR (token_expires_at = 0 AND id_token IS NOT NULL AND id_token != '')
@@ -347,11 +363,10 @@ class TokenManager:
                 ORDER BY token_expires_at ASC
                 LIMIT 10
                 """,
-                (threshold,),
+                (datetime.fromtimestamp(active_since).isoformat(), threshold),
             ).fetchall()
 
         if not rows:
-            # 没有即将过期的 token，查询下一个最近过期的来计算间隔
             return self._calc_next_check_interval()
 
         # 过滤：token_expires_at=0 的需要额外检查是否真的过期
@@ -359,16 +374,20 @@ class TokenManager:
         for row in rows:
             account = dict(row)
             if account["token_expires_at"] > 0:
-                # 有记录的过期时间，且在阈值内
                 to_refresh.append(account)
             else:
-                # 没记录过期时间，用 JWT 解码检查
                 id_token = account.get("id_token", "")
-                if id_token and is_token_expired(id_token, buffer_minutes=10):
+                if id_token and is_token_expired(id_token, buffer_minutes=3):
                     to_refresh.append(account)
 
         if not to_refresh:
             return self._calc_next_check_interval()
+
+        active_count = len(to_refresh)
+        logger.info(
+            "[TokenManager] 发现 %d 个活跃账号需要预刷新",
+            active_count,
+        )
 
         refreshed = 0
         for account in to_refresh:
@@ -380,10 +399,13 @@ class TokenManager:
             expires_at = account.get("token_expires_at", 0)
             remaining_min = int((expires_at - time.time()) / 60) if expires_at > 0 else -1
 
+            # Jitter：随机延迟 0~120 秒，防止雷群
+            jitter = random.uniform(0, MAX_JITTER_SECONDS)
             logger.info(
-                "[TokenManager] 预刷新 account_id=%d email=%s (剩余 %d 分钟)",
-                account_id, account.get("email", "?"), remaining_min,
+                "[TokenManager] 预刷新 account_id=%d email=%s (剩余 %d 分钟, jitter %.0fs)",
+                account_id, account.get("email", "?"), remaining_min, jitter,
             )
+            await asyncio.sleep(jitter)
 
             try:
                 new_token = await refresh_access_token_with_refresh_token(refresh_token)
@@ -401,8 +423,8 @@ class TokenManager:
                     self.set_firebase_blocked()
                     break
 
-            # 每个间隔 5 秒
-            await asyncio.sleep(5)
+            # 账号间基础间隔 3 秒（jitter 已在前面加过）
+            await asyncio.sleep(3)
 
         if refreshed > 0:
             logger.info("[TokenManager] 预刷新完成，本轮刷新 %d 个", refreshed)

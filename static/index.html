@@ -83,6 +83,7 @@
             border-radius: 4px;
             font-size: 12px;
             font-weight: 500;
+            white-space: nowrap;
         }
         .status-available { background: #d4edda; color: #155724; }
         .status-disabled { background: #f8d7da; color: #721c24; }
@@ -383,6 +384,8 @@
             <span style="color:#ccc;">|</span>
             <button class="btn-sm btn-secondary" onclick="selectByStatus('available')">选中所有可用</button>
             <button class="btn-sm btn-secondary" onclick="selectByStatus('disabled')">选中所有禁用</button>
+            <button class="btn-sm btn-secondary" onclick="selectByStatus('exhausted')">选中所有耗尽</button>
+            <button class="btn-sm btn-secondary" onclick="selectByStatus('token_expired')">选中所有过期</button>
             <button class="btn-sm" style="background:#6c757d;" onclick="clearSelection()">取消选择</button>
         </div>
     </div>
@@ -732,12 +735,12 @@
                     <td>${accountId}</td>
                     <td>${escapeHtml(account.email ?? '')}</td>
                     <td>${escapeHtml(localIdText)}</td>
-                    <td><span class="status-badge status-${statusCssClass}">${statusLabel}</span></td>
+                    <td><span class="status-badge status-${statusCssClass}" data-status="${statusValue}">${statusLabel}</span></td>
                     <td>${renderQuotaCell(account)}</td>
                     <td>${renderTokenExpiry(account.token_expires_at)}</td>
                     <td>${account.use_count || 0}</td>
                     <td>${account.last_check ? new Date(account.last_check).toLocaleString('zh-CN') : '-'}</td>
-                    <td>
+                    <td style="white-space:nowrap;">
                         <button class="btn-sm ${toggleBtnClass}" onclick="toggleStatus(${accountId}, '${toggleTarget}', this)">
                             ${toggleBtnText}
                         </button>
@@ -1129,7 +1132,7 @@
                 const badge = row.querySelector('.status-badge');
                 const cb = row.querySelector('.row-checkbox');
                 if (badge && cb) {
-                    cb.checked = badge.classList.contains('status-' + targetStatus);
+                    cb.checked = badge.dataset.status === targetStatus;
                 }
             });
             updateBatchBar();

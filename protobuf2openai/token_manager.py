@@ -32,6 +32,8 @@ PRE_REFRESH_BUFFER_SECONDS = 180
 ACTIVE_ACCOUNT_WINDOW_SECONDS = 7200
 # Jitter 最大偏移（秒），防止雷群效应
 MAX_JITTER_SECONDS = 120
+# 按需刷新最大并发数（防止并发请求同时打 Firebase）
+MAX_CONCURRENT_REFRESH = 2
 
 
 class TokenManager:
@@ -50,6 +52,7 @@ class TokenManager:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
         self._lock = asyncio.Lock()
+        self._refresh_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REFRESH)
         self._refresh_failures: Dict[int, float] = {}
         self._FAILURE_COOLDOWN = 60
         self._ensure_schema()
@@ -143,21 +146,36 @@ class TokenManager:
         )
 
         try:
-            new_token = await refresh_access_token_with_refresh_token(refresh_token)
-            if not new_token:
-                raise RuntimeError("refresh 返回空 token")
+            # 并发控制：最多 MAX_CONCURRENT_REFRESH 个同时刷新，其余排队
+            async with self._refresh_semaphore:
+                # 拿到信号量后再检查一次：可能排队期间别的请求已经刷新了同一账号
+                with sqlite3.connect(str(self.db_path)) as conn:
+                    row = conn.execute(
+                        "SELECT id_token FROM accounts WHERE id = ?",
+                        (account_id,),
+                    ).fetchone()
+                if row and row[0]:
+                    fresh_token = row[0]
+                    if not is_token_expired(fresh_token, buffer_minutes=5):
+                        logger.info(
+                            "[TokenManager] account_id=%d 排队期间已被其他请求刷新，直接使用",
+                            account_id,
+                        )
+                        return fresh_token
 
-            # 回写 DB
-            self._update_token_in_db(account_id, new_token)
+                new_token = await refresh_access_token_with_refresh_token(refresh_token)
+                if not new_token:
+                    raise RuntimeError("refresh 返回空 token")
 
-            # 清除失败记录
-            self._refresh_failures.pop(account_id, None)
+                # 回写 DB（在 semaphore 内，确保后续排队者能读到新 token）
+                self._update_token_in_db(account_id, new_token)
+                self._refresh_failures.pop(account_id, None)
 
-            logger.info(
-                "[TokenManager] account_id=%d token 刷新成功",
-                account_id,
-            )
-            return new_token
+                logger.info(
+                    "[TokenManager] account_id=%d token 刷新成功",
+                    account_id,
+                )
+                return new_token
 
         except Exception as exc:
             err_msg = str(exc)

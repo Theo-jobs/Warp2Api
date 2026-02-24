@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -602,7 +603,55 @@ async def verify_single_quota(account_id: int) -> dict[str, Any]:
         }
 
 
-class RegisterRequest(BaseModel):
+@app.post("/api/accounts/{account_id}/force-refresh", dependencies=[Depends(verify_admin_token)])
+async def force_refresh_single(account_id: int) -> dict[str, Any]:
+    """强制刷新单个账号 Token（清除 Firebase 限流 + 单账号冷却）。"""
+    if not ACCOUNT_ADMIN_ENABLED:
+        raise HTTPException(status_code=403, detail="Account management is disabled")
+
+    store = AccountStore(ACCOUNT_DB_PATH)
+    row = await asyncio.to_thread(_fetch_account_tokens, store.db_path, account_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    email = row["email"]
+    refresh_token = row["refresh_token"]
+    if not refresh_token:
+        return {"success": False, "detail": f"{email}: 无 refresh_token，无法刷新"}
+
+    token_mgr = TokenManager.get_instance(ACCOUNT_DB_PATH)
+    # 清除全局 Firebase 限流 + 该账号的失败冷却
+    was_blocked = token_mgr.is_firebase_blocked()
+    token_mgr._firebase_blocked_until = 0.0
+    token_mgr._refresh_failures.pop(account_id, None)
+
+    try:
+        from warp2protobuf.core.auth import refresh_access_token_with_refresh_token
+        result = await asyncio.to_thread(refresh_access_token_with_refresh_token, refresh_token)
+        new_id_token = result.get("id_token", "")
+        if not new_id_token:
+            return {"success": False, "detail": f"{email}: 刷新返回空 token"}
+
+        # 更新数据库
+        expires_at = time.time() + 3600
+        with sqlite3.connect(ACCOUNT_DB_PATH) as conn:
+            conn.execute(
+                "UPDATE accounts SET id_token = ?, token_expires_at = ?, updated_at = ? WHERE id = ?",
+                (new_id_token, expires_at, datetime.now().isoformat(), account_id),
+            )
+            conn.commit()
+
+        logger.info("[ForceRefresh] 单账号刷新成功: %s (was_firebase_blocked=%s)", email, was_blocked)
+        return {
+            "success": True,
+            "message": f"{email}: Token 刷新成功",
+            "was_firebase_blocked": was_blocked,
+            "expires_in_min": 60,
+        }
+    except Exception as e:
+        error_msg = str(e)[:200]
+        logger.error("[ForceRefresh] 单账号刷新失败: %s — %s", email, error_msg)
+        return {"success": False, "detail": f"{email}: {error_msg}"}
     count: int = 5
     delay_s: float = 5.0
     default_quota: int = 300

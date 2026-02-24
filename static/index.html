@@ -662,6 +662,7 @@
                             ${toggleBtnText}
                         </button>
                         <button class="btn-sm btn-warning" onclick="refreshQuota(${accountId}, this)">检查额度</button>
+                        <button class="btn-sm" style="background:#e67e22;color:#fff;" onclick="forceRefreshSingle(${accountId}, this)">刷新Token</button>
                     </td>
                 `;
                 tbody.appendChild(tr);
@@ -829,6 +830,29 @@
                 btn.textContent = origText;
                 btn.disabled = false;
                 btn.classList.remove('loading');
+            }
+        }
+
+
+        async function forceRefreshSingle(accountId, btn) {
+            const origText = btn.textContent;
+            btn.textContent = '刷新中...';
+            btn.disabled = true;
+            try {
+                const resp = await authFetch(`/api/accounts/${accountId}/force-refresh`, { method: 'POST' });
+                const data = await resp.json();
+                if (data.success) {
+                    showSuccess(data.message);
+                    loadAccounts(currentPage);
+                    loadSummary();
+                } else {
+                    showError(data.detail || '刷新失败');
+                }
+            } catch (e) {
+                showError('刷新Token失败: ' + e.message);
+            } finally {
+                btn.textContent = origText;
+                btn.disabled = false;
             }
         }
 

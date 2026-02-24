@@ -72,8 +72,11 @@ log "代码已同步"
 log "Step 2/7: 同步 Warp Token..."
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 if [ -f "${SCRIPT_DIR}/sync-token.sh" ]; then
-    bash "${SCRIPT_DIR}/sync-token.sh" --deploy-mode
-    log "Token 已同步"
+    if bash "${SCRIPT_DIR}/sync-token.sh" --deploy-mode; then
+        log "Token 已同步"
+    else
+        warn "Token 同步失败（不影响部署），请确认极空间 .env 文件存在"
+    fi
 else
     warn "sync-token.sh 不存在，跳过 Token 同步"
     warn "请手动在极空间创建 ${COMPOSE_DIR}/.env 文件"

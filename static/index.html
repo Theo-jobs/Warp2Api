@@ -624,19 +624,12 @@
             return 'available';
         }
 
-        // 状态中文映射
-        function statusToChinese(statusValue, tokenExpired) {
+        // 状态中文映射（完全以数据库 status 字段为准）
+        function statusToChinese(statusValue) {
             if (statusValue === 'token_expired') return 'Token过期';
-            if (tokenExpired) return 'Token过期';
             if (statusValue === 'disabled') return '已禁用';
             if (statusValue === 'exhausted') return '额度耗尽';
             return '可用';
-        }
-
-        // 判断 token 是否已过期
-        function isTokenExpired(expiresAt) {
-            if (!expiresAt || expiresAt <= 0) return false;
-            return expiresAt < Date.now() / 1000;
         }
 
         function renderRecentAccounts(accounts) {
@@ -645,7 +638,7 @@
 
             const lines = accounts.slice(0, 5).map(account => {
                 const statusValue = normalizeStatus(account.status);
-                const statusText = statusToChinese(statusValue, false);
+                const statusText = statusToChinese(statusValue);
                 const email = escapeHtml(account.email ?? '-');
                 const remaining = Number(account.remaining_limit) || 0;
                 const usedCount = Number(account.use_count) || 0;
@@ -717,7 +710,6 @@
                 const tr = document.createElement('tr');
                 tr.id = `account-row-${accountId}`;
                 const statusValue = normalizeStatus(account.status);
-                const tokenExpired = isTokenExpired(account.token_expires_at);
                 const isDisabled = statusValue === 'disabled';
                 const isExhausted = statusValue === 'exhausted';
                 const isTokenExp = statusValue === 'token_expired';
@@ -725,8 +717,8 @@
                 const toggleBtnClass = isInactive ? 'btn-enable' : 'btn-disable';
                 const toggleBtnText = isInactive ? '启用' : '禁用';
                 const toggleTarget = isInactive ? 'available' : 'disabled';
-                const statusLabel = statusToChinese(statusValue, tokenExpired);
-                const statusCssClass = (statusValue === 'token_expired' || tokenExpired) ? 'token-expired' : statusValue;
+                const statusLabel = statusToChinese(statusValue);
+                const statusCssClass = statusValue === 'token_expired' ? 'token-expired' : statusValue;
                 const localIdText = typeof account.local_id === 'string' && account.local_id
                     ? `${account.local_id.substring(0, 20)}...`
                     : '-';

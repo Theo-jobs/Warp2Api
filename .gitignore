@@ -23,3 +23,8 @@ rust-proxy/target/
 
 # Docker exported images
 *.tar.gz
+
+# SQLite databases
+*.db
+*.db-shm
+*.db-wal

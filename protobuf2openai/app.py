@@ -114,7 +114,7 @@ def _fetch_account_tokens(db_path: Path, account_id: int) -> dict[str, Any] | No
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id, email, id_token, refresh_token FROM accounts WHERE id = ?",
+            "SELECT id, email, id_token, refresh_token, status FROM accounts WHERE id = ?",
             (account_id,),
         )
         row = cursor.fetchone()
@@ -524,8 +524,14 @@ async def batch_verify_quota() -> dict[str, Any]:
             quota_info, new_token = await _resolve_quota_with_token_strategy(id_token, refresh_token)
             total_limit = quota_info["request_limit"]
             used_limit = quota_info["used"]
+            remaining = quota_info.get("remaining", total_limit - used_limit)
 
             store.update_limit(account_id, total_limit, used_limit)
+            # 额度归零 → 标记 exhausted；额度恢复 → 重新启用
+            if remaining <= 0:
+                store.update_status(account_id, "exhausted")
+            elif account.get("status") == "exhausted" and remaining > 0:
+                store.update_status(account_id, "available")
             # 如果触发了 token 刷新，写回数据库
             if new_token:
                 _save_refreshed_token(account_id, new_token)
@@ -606,8 +612,15 @@ async def verify_single_quota(account_id: int) -> dict[str, Any]:
         quota_info, new_token = await _resolve_quota_with_token_strategy(id_token, refresh_token)
         total_limit = quota_info["request_limit"]
         used_limit = quota_info["used"]
+        remaining = quota_info.get("remaining", total_limit - used_limit)
 
         store.update_limit(account_id, total_limit, used_limit)
+        # 额度归零 → 标记 exhausted；额度恢复 → 重新启用
+        current_status = row["status"] if "status" in row.keys() else None
+        if remaining <= 0:
+            store.update_status(account_id, "exhausted")
+        elif current_status == "exhausted" and remaining > 0:
+            store.update_status(account_id, "available")
         if new_token:
             _save_refreshed_token(account_id, new_token)
 

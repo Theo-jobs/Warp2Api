@@ -130,6 +130,15 @@ show_account_info() {
     echo ""
 }
 
+# ========== 从 .env 文件读取指定变量 ==========
+get_env_var() {
+    local var_name="$1"
+    local file_path="${2:-$LOCAL_ENV_FILE}"
+    if [ -f "$file_path" ]; then
+        grep "^${var_name}=" "$file_path" 2>/dev/null | head -1 | cut -d'=' -f2- | sed 's/^"//' | sed 's/"$//' | sed "s/^'//" | sed "s/'$//"
+    fi
+}
+
 # ========== 生成 .env 内容 ==========
 generate_env_content() {
     local api_token="${1:-}"
@@ -142,6 +151,10 @@ generate_env_content() {
     # 兼容旧逻辑：仍兜底 0000，但尽量保留旧 token
     api_token="${api_token:-0000}"
 
+    # 从环境变量或本地 .env 读取 Firebase 配置
+    local firebase_key="${FIREBASE_API_KEY:-$(get_env_var FIREBASE_API_KEY)}"
+    local refresh_b64="${WARP_REFRESH_TOKEN_B64:-$(get_env_var WARP_REFRESH_TOKEN_B64)}"
+
     cat <<ENVEOF
 # Warp2Api 环境变量（由 sync-token.sh 自动生成）
 # 帐号: ${ACCOUNT_EMAIL:-未知}
@@ -150,6 +163,10 @@ generate_env_content() {
 # Warp 认证
 WARP_REFRESH_TOKEN=${REFRESH_TOKEN}
 WARP_JWT=
+
+# Firebase token 刷新
+FIREBASE_API_KEY=${firebase_key}
+WARP_REFRESH_TOKEN_B64=${refresh_b64}
 
 # API 对外认证令牌
 API_TOKEN=${api_token}

@@ -42,7 +42,7 @@ class TokenManager:
 
     # 全局 Firebase 限流标记（类级别，所有实例共享）
     _firebase_blocked_until: float = 0.0
-    _FIREBASE_COOLDOWN = 1800  # Firebase 限流后全局冷却 30 分钟
+    _FIREBASE_COOLDOWN = 600  # Firebase 限流后全局冷却 10 分钟
 
     # 后台预刷新任务引用
     _refresh_task: Optional[asyncio.Task] = None

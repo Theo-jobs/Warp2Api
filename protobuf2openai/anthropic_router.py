@@ -607,6 +607,40 @@ async def _auto_sync_quota_on_empty(token_mgr: "TokenManager") -> None:
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Count tokens (stub) — CLI 会调用此端点预估 token 数
+# ---------------------------------------------------------------------------
+
+@anthropic_router.post("/v1/messages/count_tokens")
+async def count_tokens(request: Request) -> JSONResponse:
+    """Stub: 粗略估算 input tokens，避免 CLI Proxy 收到 404。"""
+    await authenticate_request(request)
+    body = await request.json()
+
+    # 粗略估算：将所有 messages 文本拼接，按 4 字符 ≈ 1 token 估算
+    total_chars = 0
+    for msg in body.get("messages", []):
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            total_chars += len(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    total_chars += len(block.get("text", ""))
+    # system prompt
+    system = body.get("system", "")
+    if isinstance(system, str):
+        total_chars += len(system)
+    elif isinstance(system, list):
+        for block in system:
+            if isinstance(block, dict):
+                total_chars += len(block.get("text", ""))
+
+    estimated_tokens = max(1, total_chars // 4)
+    return JSONResponse({"input_tokens": estimated_tokens})
+
+
+# ---------------------------------------------------------------------------
 # Main endpoint
 # ---------------------------------------------------------------------------
 

@@ -12,11 +12,11 @@
 # ============================================================
 set -euo pipefail
 
-# ---------- 极空间 SSH 配置 ----------
-SSH_HOST="192.168.50.200"
-SSH_PORT="10000"
-SSH_USER="18668588631"
-SSH_PASS="cz.950427"
+# ---------- 极空间 SSH 配置（从环境变量读取） ----------
+SSH_HOST="${DEPLOY_LOCAL_SSH_HOST:-${DEPLOY_SSH_HOST:?请设置 DEPLOY_SSH_HOST 或 DEPLOY_LOCAL_SSH_HOST 环境变量}}"
+SSH_PORT="${DEPLOY_LOCAL_SSH_PORT:-${DEPLOY_SSH_PORT:-10000}}"
+SSH_USER="${DEPLOY_SSH_USER:?请设置 DEPLOY_SSH_USER 环境变量}"
+SSH_PASS="${DEPLOY_SSH_PASS:?请设置 DEPLOY_SSH_PASS 环境变量}"
 COMPOSE_DIR="/tmp/zfsv3/nvme12/18668588631/data/my_docker/warp2api"
 CONTAINER_NAME="warp2api"
 # -------------------------------------

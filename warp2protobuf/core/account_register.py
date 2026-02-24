@@ -24,6 +24,7 @@ import httpx
 from ..config.settings import (
     CLIENT_ID,
     CLIENT_VERSION,
+    FIREBASE_API_KEY,
     OS_CATEGORY,
     OS_NAME,
     OS_VERSION,
@@ -34,12 +35,11 @@ from ..config.settings import (
 )
 from .logging import logger
 
-_FIREBASE_API_KEY = "AIzaSyBdy3O3S9hrdayLJxJ7mriBR4qgUaUygAs"
 # GraphQL 走 rustls proxy 避免 TLS 指纹限流
 _ANON_GQL_URL_DIRECT = "https://app.warp.dev/graphql/v2?op=CreateAnonymousUser"
 _ANON_GQL_URL_PROXY = "http://127.0.0.1:28887/graphql/v2?op=CreateAnonymousUser"
-_SIGNIN_URL = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key={_FIREBASE_API_KEY}"
-_UPDATE_URL = f"https://identitytoolkit.googleapis.com/v1/accounts:update?key={_FIREBASE_API_KEY}"
+_SIGNIN_URL = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key={FIREBASE_API_KEY}"
+_UPDATE_URL = f"https://identitytoolkit.googleapis.com/v1/accounts:update?key={FIREBASE_API_KEY}"
 # GetOrCreateUser 走 rustls proxy 激活 Warp 用户（缺少此步新账号 AI 请求会 400）
 _GETORCREATE_URL_DIRECT = "https://app.warp.dev/graphql/v2?op=GetOrCreateUser"
 _GETORCREATE_URL_PROXY = "http://127.0.0.1:28887/graphql/v2?op=GetOrCreateUser"

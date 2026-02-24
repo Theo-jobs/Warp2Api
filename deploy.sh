@@ -5,11 +5,11 @@
 # ============================================================
 set -euo pipefail
 
-# ---------- 配置区（按需修改） ----------
-SSH_HOST="100.66.1.1"
-SSH_PORT="10000"
-SSH_USER="18668588631"
-SSH_PASS="cz.950427"
+# ---------- 配置区（从环境变量读取敏感信息） ----------
+SSH_HOST="${DEPLOY_SSH_HOST:?请设置 DEPLOY_SSH_HOST 环境变量}"
+SSH_PORT="${DEPLOY_SSH_PORT:-10000}"
+SSH_USER="${DEPLOY_SSH_USER:?请设置 DEPLOY_SSH_USER 环境变量}"
+SSH_PASS="${DEPLOY_SSH_PASS:?请设置 DEPLOY_SSH_PASS 环境变量}"
 REMOTE_DIR="/tmp/zfsv3/nvme12/18668588631/data/my_docker/warp2api/Warp2Api"
 COMPOSE_DIR="/tmp/zfsv3/nvme12/18668588631/data/my_docker/warp2api"
 CONTAINER_NAME="warp2api"

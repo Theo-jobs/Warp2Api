@@ -341,7 +341,10 @@ async def _create_anonymous_user() -> dict:
 
 async def _exchange_id_token_for_refresh_token(id_token: str) -> dict:
     key = _extract_google_api_key_from_refresh_url()
-    url = f"{_IDENTITY_TOOLKIT_BASE}?key={key}" if key else f"{_IDENTITY_TOOLKIT_BASE}?key=AIzaSyBdy3O3S9hrdayLJxJ7mriBR4qgUaUygAs"
+    if not key:
+        from ..config.settings import FIREBASE_API_KEY
+        key = FIREBASE_API_KEY
+    url = f"{_IDENTITY_TOOLKIT_BASE}?key={key}"
     headers = {
         "accept-encoding": "gzip, br",
         "content-type": "application/x-www-form-urlencoded",

@@ -10,14 +10,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import re
 import sqlite3
 import time
 import uuid
 from typing import Any
 
-import requests
+import httpx
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -27,6 +26,7 @@ from warp2protobuf.config.settings import (
     HISTORY_TOOL_RESULT_MAX_CHARS,
 )
 from warp2protobuf.core.account_selector import AccountSelector
+from warp2protobuf.core.db import get_connection
 from warp2protobuf.config.models import resolve_model
 
 from .anthropic_models import AnthropicMessagesRequest, AnthropicUsage
@@ -44,17 +44,21 @@ from .token_manager import TokenManager
 _BRIDGE_SEMAPHORE = asyncio.Semaphore(2)
 # 全局 bridge 429 冷却（秒）
 _bridge_429_until: float = 0.0
+_bridge_429_lock = asyncio.Lock()
 _BRIDGE_429_COOLDOWN = 30  # bridge 429 后冷却 30 秒
 _BRIDGE_MAX_WAIT = 90  # 排队最大等待时间（秒），超时才返回 429
+
+from .utils import safe_create_task
 
 
 def _is_bridge_throttled() -> bool:
     return time.time() < _bridge_429_until
 
 
-def _set_bridge_throttled() -> None:
+async def _set_bridge_throttled() -> None:
     global _bridge_429_until
-    _bridge_429_until = time.time() + _BRIDGE_429_COOLDOWN
+    async with _bridge_429_lock:
+        _bridge_429_until = time.time() + _BRIDGE_429_COOLDOWN
     logging.getLogger(__name__).warning(
         "[Anthropic] Bridge 429 全局冷却已触发，%ds 内新请求排队等待", _BRIDGE_429_COOLDOWN
     )
@@ -100,7 +104,7 @@ def _extract_usage_from_chunk(
 
 def _get_account_by_id_with_tokens(db_path: str, account_id: int) -> dict[str, Any] | None:
     """按账号 ID 获取完整账号信息（含 id_token/refresh_token）。"""
-    with sqlite3.connect(str(db_path)) as conn:
+    with get_connection(str(db_path)) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute(
@@ -575,7 +579,7 @@ async def _auto_sync_quota_on_empty(token_mgr: "TokenManager") -> None:
     目的：本地 used_limit 可能虚高，同步真实额度后可能恢复可用。
     """
     try:
-        with sqlite3.connect(str(token_mgr.db_path)) as conn:
+        with get_connection(str(token_mgr.db_path)) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 """SELECT id, email, id_token, refresh_token
@@ -587,11 +591,12 @@ async def _auto_sync_quota_on_empty(token_mgr: "TokenManager") -> None:
             ).fetchall()
         if not rows:
             return
+        from warp2protobuf.core.auth import refresh_access_token_with_refresh_token
         for row in rows:
             try:
                 token = row["id_token"]
                 if not token or token == "":
-                    token = await token_mgr._do_refresh(row["refresh_token"])
+                    token = await refresh_access_token_with_refresh_token(row["refresh_token"])
                 if token:
                     await token_mgr.sync_account_quota(row["id"], token)
             except Exception as e:
@@ -636,7 +641,7 @@ async def anthropic_messages(request: Request) -> Any:
     if not account:
         # 无可用账号 → 自动触发一次快速额度同步（fire-and-forget），可能是本地计数虚高
         if not token_mgr.is_firebase_blocked():
-            asyncio.create_task(_auto_sync_quota_on_empty(token_mgr))
+            safe_create_task(_auto_sync_quota_on_empty(token_mgr))
         if token_mgr.is_firebase_blocked():
             remaining = int((TokenManager._firebase_blocked_until - time.time()) / 60)
             raise HTTPException(
@@ -682,12 +687,8 @@ async def anthropic_messages(request: Request) -> Any:
 
     account_id = account["id"] if account else 0
 
-    # 在锁保护下设置 JWT
-    async with token_mgr.env_lock:
-        os.environ["WARP_JWT"] = access_token
-
     try:
-        initialize_once()
+        await initialize_once()
     except Exception as e:
         logger.warning("[Anthropic] initialize_once failed or skipped: %s", e)
 
@@ -832,7 +833,7 @@ async def anthropic_messages(request: Request) -> Any:
                         total_tokens = _input_tokens + _output_tokens
                         selector.record_usage(_stream_account_id, 1)
                         # fire-and-forget: 同步真实额度（不同模型消耗不同 credits）
-                        asyncio.create_task(token_mgr.sync_account_quota(_stream_account_id, _stream_access_token))
+                        safe_create_task(token_mgr.sync_account_quota(_stream_account_id, _stream_access_token))
                         logger.info(
                             "[Anthropic] stream done: account_id=%d input=%d output=%d total=%d",
                             _stream_account_id, _input_tokens, _output_tokens, total_tokens,
@@ -844,7 +845,7 @@ async def anthropic_messages(request: Request) -> Any:
                         return
 
                     # 429 → 触发全局冷却，直接返回错误给 CC（不内部重试）
-                    _set_bridge_throttled()
+                    await _set_bridge_throttled()
                     token_mgr.mark_account_failed(_stream_account_id)
                     logger.warning(
                         "[Anthropic] stream 429 on account_id=%d, returning to client (no internal retry)",
@@ -875,24 +876,22 @@ async def anthropic_messages(request: Request) -> Any:
     }
 
     try:
-        resp = requests.post(
-            bridge_url,
-            json=req_body,
-            timeout=(5.0, 180.0),
-        )
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, read=180.0)) as client:
+            resp = await client.post(bridge_url, json=req_body)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"bridge_unreachable: {exc}") from exc
 
     # --- 429 限流：触发冷却，排队等待后重试一次 ---
     if resp.status_code == 429:
-        _set_bridge_throttled()
+        await _set_bridge_throttled()
         token_mgr.mark_account_failed(account_id)
         logger.warning("[Anthropic] non-stream 429 on account_id=%d, waiting for cooldown", account_id)
         ready = await _wait_for_bridge_ready()
         if ready:
             # 冷却结束，重试一次
             try:
-                resp = requests.post(bridge_url, json=req_body, timeout=(5.0, 180.0))
+                async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, read=180.0)) as client:
+                    resp = await client.post(bridge_url, json=req_body)
                 logger.info("[Anthropic] non-stream 429 retry result: %d", resp.status_code)
             except Exception as exc:
                 raise HTTPException(status_code=502, detail=f"bridge_unreachable on retry: {exc}") from exc
@@ -924,7 +923,7 @@ async def anthropic_messages(request: Request) -> Any:
     total_tokens = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
     selector.record_usage(account_id, 1)
     # fire-and-forget: 同步真实额度（不同模型消耗不同 credits）
-    asyncio.create_task(token_mgr.sync_account_quota(account_id, access_token))
+    safe_create_task(token_mgr.sync_account_quota(account_id, access_token))
     logger.info(
         "[Anthropic] non-stream done: account_id=%d input=%d output=%d total=%d",
         account_id, usage.get("input_tokens", 0), usage.get("output_tokens", 0), total_tokens,
@@ -952,11 +951,8 @@ async def build_streaming_response_for_account(
     if not access_token:
         raise HTTPException(status_code=503, detail=f"Account #{account_id} has no valid token")
 
-    async with token_mgr.env_lock:
-        os.environ["WARP_JWT"] = access_token
-
     try:
-        initialize_once()
+        await initialize_once()
     except Exception as e:
         logger.warning("[AnthropicTest] initialize_once failed or skipped: %s", e)
 

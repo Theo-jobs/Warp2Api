@@ -22,6 +22,7 @@ from warp2protobuf.core.auth import (
     is_token_expired,
     refresh_access_token_with_refresh_token,
 )
+from warp2protobuf.core.db import get_connection
 from warp2protobuf.core.logging import logger
 
 # Token 有效期常量（Firebase id_token = 60 分钟）
@@ -34,6 +35,8 @@ ACTIVE_ACCOUNT_WINDOW_SECONDS = 7200
 MAX_JITTER_SECONDS = 120
 # 按需刷新最大并发数（防止并发请求同时打 Firebase）
 MAX_CONCURRENT_REFRESH = 2
+
+from .utils import safe_create_task
 
 
 class TokenManager:
@@ -52,15 +55,21 @@ class TokenManager:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
         self._lock = asyncio.Lock()
-        self._refresh_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REFRESH)
+        self._per_account_locks: Dict[int, asyncio.Lock] = {}
         self._refresh_failures: Dict[int, float] = {}
         self._FAILURE_COOLDOWN = 60
         self._ensure_schema()
 
+    def _get_account_lock(self, account_id: int) -> asyncio.Lock:
+        """获取 per-account 刷新锁，防止同一账号并发刷新。"""
+        if account_id not in self._per_account_locks:
+            self._per_account_locks[account_id] = asyncio.Lock()
+        return self._per_account_locks[account_id]
+
     def _ensure_schema(self) -> None:
         """确保 accounts 表有 token_expires_at 列。"""
         try:
-            with sqlite3.connect(str(self.db_path)) as conn:
+            with get_connection(str(self.db_path)) as conn:
                 cols = [r[1] for r in conn.execute("PRAGMA table_info(accounts)").fetchall()]
                 if "token_expires_at" not in cols:
                     conn.execute("ALTER TABLE accounts ADD COLUMN token_expires_at REAL DEFAULT 0")
@@ -146,10 +155,11 @@ class TokenManager:
         )
 
         try:
-            # 并发控制：最多 MAX_CONCURRENT_REFRESH 个同时刷新，其余排队
-            async with self._refresh_semaphore:
-                # 拿到信号量后再检查一次：可能排队期间别的请求已经刷新了同一账号
-                with sqlite3.connect(str(self.db_path)) as conn:
+            # per-account 锁：同一账号同时只有一个刷新，其余排队
+            account_lock = self._get_account_lock(account_id)
+            async with account_lock:
+                # 拿到锁后再检查一次：可能排队期间别的请求已经刷新了同一账号
+                with get_connection(str(self.db_path)) as conn:
                     row = conn.execute(
                         "SELECT id_token FROM accounts WHERE id = ?",
                         (account_id,),
@@ -167,7 +177,7 @@ class TokenManager:
                 if not new_token:
                     raise RuntimeError("refresh 返回空 token")
 
-                # 回写 DB（在 semaphore 内，确保后续排队者能读到新 token）
+                # 回写 DB（在锁内，确保后续排队者能读到新 token）
                 self._update_token_in_db(account_id, new_token)
                 self._refresh_failures.pop(account_id, None)
 
@@ -176,7 +186,7 @@ class TokenManager:
                     account_id,
                 )
                 # 异步同步额度（不阻塞请求热路径）
-                asyncio.create_task(self.sync_account_quota(account_id, new_token))
+                safe_create_task(self.sync_account_quota(account_id, new_token))
                 return new_token
 
         except Exception as exc:
@@ -199,7 +209,7 @@ class TokenManager:
         """将刷新后的 token 和过期时间回写数据库。"""
         now = datetime.now().isoformat()
         expires_at = _extract_exp_from_jwt(new_token)
-        with sqlite3.connect(str(self.db_path)) as conn:
+        with get_connection(str(self.db_path)) as conn:
             conn.execute(
                 """
                 UPDATE accounts SET
@@ -231,7 +241,7 @@ class TokenManager:
     def mark_account_exhausted(self, account_id: int) -> None:
         """标记账号额度耗尽，设置 status='exhausted' 从选择池中剔除。"""
         try:
-            with sqlite3.connect(str(self.db_path)) as conn:
+            with get_connection(str(self.db_path)) as conn:
                 now = datetime.now().isoformat()
                 conn.execute(
                     "UPDATE accounts SET status = 'exhausted', updated_at = ? WHERE id = ?",
@@ -257,7 +267,7 @@ class TokenManager:
             used = quota.get("used", 0)
             remaining = quota.get("remaining", 0)
 
-            with sqlite3.connect(str(self.db_path)) as conn:
+            with get_connection(str(self.db_path)) as conn:
                 now = datetime.now().isoformat()
                 conn.execute(
                     """UPDATE accounts SET
@@ -277,7 +287,7 @@ class TokenManager:
                 self.mark_account_exhausted(account_id)
             else:
                 # 查询成功说明 token 有效，如果之前是 token_expired/exhausted 则恢复
-                with sqlite3.connect(str(self.db_path)) as conn:
+                with get_connection(str(self.db_path)) as conn:
                     row = conn.execute(
                         "SELECT status FROM accounts WHERE id = ?", (account_id,)
                     ).fetchone()
@@ -320,7 +330,7 @@ class TokenManager:
             )
             return stats
 
-        with sqlite3.connect(str(self.db_path)) as conn:
+        with get_connection(str(self.db_path)) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 "SELECT id, email, id_token, refresh_token FROM accounts WHERE status = 'available'"
@@ -394,10 +404,24 @@ class TokenManager:
             logger.info("[TokenManager] 后台预刷新任务已在运行")
             return
         self._refresh_task = asyncio.create_task(self._background_refresh_loop())
+        self._refresh_task.add_done_callback(self._on_refresh_task_done)
         logger.info(
             "[TokenManager] ✅ 后台预刷新已启动（动态间隔，到期前 %d 分钟刷新，仅刷新活跃账号）",
             PRE_REFRESH_BUFFER_SECONDS // 60,
         )
+
+    def _on_refresh_task_done(self, task: asyncio.Task) -> None:
+        """后台刷新任务结束回调：记录崩溃日志 + 自动重启。"""
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            logger.info("[TokenManager] 后台预刷新任务被取消")
+            return
+        if exc:
+            logger.error("[TokenManager] 后台预刷新任务崩溃: %s，5 秒后自动重启", exc)
+            # 延迟重启，避免快速循环崩溃
+            loop = asyncio.get_running_loop()
+            loop.call_later(5, self.start_background_refresh)
 
     async def _background_refresh_loop(self) -> None:
         """后台循环：动态计算下次检查时间，基于最近即将过期的 token。"""
@@ -438,7 +462,7 @@ class TokenManager:
         threshold = now + PRE_REFRESH_BUFFER_SECONDS
         active_since = now - ACTIVE_ACCOUNT_WINDOW_SECONDS
 
-        with sqlite3.connect(str(self.db_path)) as conn:
+        with get_connection(str(self.db_path)) as conn:
             conn.row_factory = sqlite3.Row
             # 仅查询活跃账号（last_used 在 2 小时内）且即将过期的
             rows = conn.execute(
@@ -529,7 +553,7 @@ class TokenManager:
         # ── 僵尸账号清扫：available 但 token 已过期的，标记为 token_expired ──
         # 这样 _check_exhausted_accounts 会自动接管刷新+恢复
         try:
-            with sqlite3.connect(str(self.db_path)) as conn:
+            with get_connection(str(self.db_path)) as conn:
                 stale_count = conn.execute(
                     """UPDATE accounts SET status = 'token_expired', updated_at = ?
                        WHERE status = 'available'
@@ -552,7 +576,7 @@ class TokenManager:
     def _calc_next_check_interval(self) -> int:
         """根据最近即将过期的 token 计算下次检查间隔（秒）。"""
         try:
-            with sqlite3.connect(str(self.db_path)) as conn:
+            with get_connection(str(self.db_path)) as conn:
                 row = conn.execute(
                     """
                     SELECT MIN(token_expires_at) as nearest
@@ -574,9 +598,11 @@ class TokenManager:
         return 300  # 默认 5 分钟
 
     async def _check_exhausted_accounts(self) -> None:
-        """渐进式检查 exhausted 账号，如果服务端额度已恢复则自动重新启用。
+        """渐进式检查 exhausted / token_expired 账号，如果服务端额度已恢复则自动重新启用。
 
         策略：
+        - exhausted（额度耗尽）：不刷新 token（省 Firebase 调用），用现有 token 查额度，token 也过期则跳过
+        - token_expired（token 过期）：刷新 token + 查额度
         - 每次后台循环都会调用，但只查 updated_at 距今 ≥4 小时的（刚耗尽的不查）
         - 每次最多查 2 个（按 updated_at ASC，最久没检查的优先）
         - 查完更新 updated_at，下次循环自然轮到下一批
@@ -586,10 +612,11 @@ class TokenManager:
 
         min_age = time.time() - 4 * 3600  # 至少 4 小时前标记/检查的才查
 
-        with sqlite3.connect(str(self.db_path)) as conn:
+        with get_connection(str(self.db_path)) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                """SELECT id, email, refresh_token, updated_at
+                """SELECT id, email, refresh_token, id_token, token_expires_at, status,
+                          total_limit, used_limit
                    FROM accounts
                    WHERE status IN ('exhausted', 'token_expired')
                      AND refresh_token IS NOT NULL AND refresh_token != ''
@@ -602,7 +629,7 @@ class TokenManager:
         if not rows:
             return
 
-        logger.info("[TokenManager] 渐进检查 %d 个 exhausted 账号", len(rows))
+        logger.info("[TokenManager] 渐进检查 %d 个 exhausted/token_expired 账号", len(rows))
         recovered = 0
 
         for row in rows:
@@ -610,27 +637,46 @@ class TokenManager:
                 break
 
             account_id = row["id"]
+            account_status = row["status"]
             refresh_token = row["refresh_token"]
+            id_token = row["id_token"] or ""
+            token_expires_at = row["token_expires_at"] or 0
 
             try:
-                # 先刷新 token（exhausted 账号的 token 大概率已过期）
-                new_token = await refresh_access_token_with_refresh_token(refresh_token)
-                if not new_token:
-                    # 刷新失败也更新 updated_at，避免反复重试同一个
-                    self._touch_updated_at(account_id)
-                    continue
+                total_limit = row["total_limit"] or 0
+                used_limit = row["used_limit"] or 0
+                quota_fully_used = total_limit > 0 and used_limit >= total_limit
 
-                self._update_token_in_db(account_id, new_token)
+                if quota_fully_used:
+                    # 额度确实用完（如 300/300）：不刷新 token，用现有 token 查额度即可
+                    # 如果 token 也过期了，跳过（等额度重置周期后再查）
+                    token_valid = id_token and (token_expires_at == 0 or token_expires_at > time.time())
+                    if not token_valid:
+                        logger.debug(
+                            "[TokenManager] account_id=%d 额度已满 (%d/%d) 且 token 过期，跳过",
+                            account_id, used_limit, total_limit,
+                        )
+                        self._touch_updated_at(account_id)
+                        continue
+                    access_token = id_token
+                else:
+                    # 额度未满或 token_expired：刷新 token + 查额度
+                    new_token = await refresh_access_token_with_refresh_token(refresh_token)
+                    if not new_token:
+                        self._touch_updated_at(account_id)
+                        continue
+                    self._update_token_in_db(account_id, new_token)
+                    access_token = new_token
 
                 # 查询服务端真实额度
                 from warp2protobuf.core.quota import get_request_limit_info
-                quota = await get_request_limit_info(new_token)
+                quota = await get_request_limit_info(access_token)
                 total = quota.get("request_limit", 0)
                 used = quota.get("used", 0)
                 remaining = quota.get("remaining", 0)
 
                 now_str = datetime.now().isoformat()
-                with sqlite3.connect(str(self.db_path)) as conn:
+                with get_connection(str(self.db_path)) as conn:
                     conn.execute(
                         """UPDATE accounts SET
                             total_limit = ?, used_limit = ?, last_check = ?, updated_at = ?
@@ -652,8 +698,8 @@ class TokenManager:
             except Exception as exc:
                 err_msg = str(exc)
                 logger.warning(
-                    "[TokenManager] exhausted account_id=%d 恢复检查失败: %s",
-                    account_id, exc,
+                    "[TokenManager] account_id=%d (%s) 恢复检查失败: %s",
+                    account_id, account_status, exc,
                 )
                 # 失败也更新 updated_at，避免卡在同一个账号
                 self._touch_updated_at(account_id)
@@ -669,7 +715,7 @@ class TokenManager:
     def _touch_updated_at(self, account_id: int) -> None:
         """仅更新 updated_at，用于推后下次检查时间。"""
         try:
-            with sqlite3.connect(str(self.db_path)) as conn:
+            with get_connection(str(self.db_path)) as conn:
                 conn.execute(
                     "UPDATE accounts SET updated_at = ? WHERE id = ?",
                     (datetime.now().isoformat(), account_id),

@@ -7,10 +7,12 @@
 """
 import random
 import sqlite3
+import threading
 import time
 from datetime import datetime
 from typing import Dict, List, Optional, Set
 
+from .db import get_connection
 from .account_store import AccountStore
 from .logging import logger
 
@@ -19,9 +21,6 @@ VALID_STRATEGIES = ("least_used", "round_robin", "random", "most_quota", "priori
 
 # Token 过期安全缓冲（秒）：排除 5 分钟内过期的账号
 _TOKEN_EXPIRY_BUFFER = 300
-
-# round_robin 全局游标
-_round_robin_cursor: int = 0
 
 # 运行时策略覆盖（None 表示使用环境变量配置）
 _runtime_strategy: Optional[str] = None
@@ -84,12 +83,14 @@ class AccountSelector:
     def __init__(self, db_path: str):
         self.store = AccountStore(db_path)
         self.db_path = self.store.db_path
+        self._round_robin_cursor: int = 0
+        self._rr_lock = threading.Lock()
         self._ensure_priority_column()
 
     def _ensure_priority_column(self) -> None:
         """确保 accounts 表有 priority 列。"""
         try:
-            with sqlite3.connect(str(self.db_path)) as conn:
+            with get_connection(str(self.db_path)) as conn:
                 cols = {r[1] for r in conn.execute("PRAGMA table_info(accounts)")}
                 if "priority" not in cols:
                     conn.execute(
@@ -143,8 +144,6 @@ class AccountSelector:
         Returns:
             账号字典（含完整 token），无可用账号返回 None
         """
-        global _round_robin_cursor
-
         strat = strategy or _get_strategy()
         where_sql, params = self._build_base_where(exclude_ids)
 
@@ -155,7 +154,7 @@ class AccountSelector:
             FROM accounts
         """
 
-        with sqlite3.connect(str(self.db_path)) as conn:
+        with get_connection(str(self.db_path)) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
 
@@ -169,22 +168,22 @@ class AccountSelector:
                 row = random.choice(rows)
 
             elif strat == "round_robin":
-                # 查出所有候选按 ID 排序，用游标取下一个
+                # 查出所有候选按 ID 排序，用游标取下一个（加锁保护）
                 order = _order_by_round_robin()
                 cursor.execute(f"{select_cols} {where_sql} {order}", params)
                 rows = cursor.fetchall()
                 if not rows:
                     logger.warning("[AccountSelector] 无可用账号 (strategy=%s)", strat)
                     return None
-                # 找到第一个 id > cursor 的，否则回到第一个
-                row = None
-                for r in rows:
-                    if r["id"] > _round_robin_cursor:
-                        row = r
-                        break
-                if row is None:
-                    row = rows[0]
-                _round_robin_cursor = row["id"]
+                with self._rr_lock:
+                    row = None
+                    for r in rows:
+                        if r["id"] > self._round_robin_cursor:
+                            row = r
+                            break
+                    if row is None:
+                        row = rows[0]
+                    self._round_robin_cursor = row["id"]
 
             elif strat == "most_quota":
                 order = _order_by_most_quota()
@@ -221,8 +220,11 @@ class AccountSelector:
             return account
 
     def record_usage(self, account_id: int, request_count: int = 1) -> bool:
-        """记录账号使用（按请求次数递增 used_limit，与 Warp 的 request_limit 单位一致）。"""
-        with sqlite3.connect(str(self.db_path)) as conn:
+        """记录账号使用（按请求次数递增 used_limit，与 Warp 的 request_limit 单位一致）。
+
+        递增后如果 used_limit >= total_limit，立即标记 exhausted，不等异步 sync。
+        """
+        with get_connection(str(self.db_path)) as conn:
             cursor = conn.cursor()
             now = datetime.now().isoformat()
             cursor.execute("""
@@ -235,7 +237,25 @@ class AccountSelector:
             """, (request_count, now, now, account_id))
             conn.commit()
             success = cursor.rowcount > 0
+
             if success:
+                # 立即检查是否超限，不依赖异步 sync
+                row = cursor.execute(
+                    "SELECT total_limit, used_limit FROM accounts WHERE id = ?",
+                    (account_id,),
+                ).fetchone()
+                if row and row[0] > 0 and row[1] >= row[0]:
+                    cursor.execute(
+                        "UPDATE accounts SET status = 'exhausted', updated_at = ? WHERE id = ? AND status = 'available'",
+                        (now, account_id),
+                    )
+                    conn.commit()
+                    if cursor.rowcount > 0:
+                        logger.warning(
+                            "[AccountSelector] account_id=%d 本地额度耗尽 (%d/%d)，立即标记 exhausted",
+                            account_id, row[1], row[0],
+                        )
+
                 logger.info(
                     "[AccountSelector] Recorded usage: account_id=%d requests=+%d",
                     account_id, request_count,
@@ -249,7 +269,7 @@ class AccountSelector:
 
     def get_recently_used_accounts(self, limit: int = 10) -> List[Dict]:
         """获取最近使用的账号列表（脱敏）。"""
-        with sqlite3.connect(str(self.db_path)) as conn:
+        with get_connection(str(self.db_path)) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute("""
@@ -266,7 +286,7 @@ class AccountSelector:
 
     def get_pool_status(self) -> Dict:
         """获取账号池状态。"""
-        with sqlite3.connect(str(self.db_path)) as conn:
+        with get_connection(str(self.db_path)) as conn:
             cursor = conn.cursor()
 
             cursor.execute("SELECT COUNT(*) FROM accounts")

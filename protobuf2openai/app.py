@@ -34,6 +34,7 @@ from warp2protobuf.config.settings import (
     ACCOUNT_SELECT_STRATEGY,
 )
 from warp2protobuf.core.account_store import AccountStore
+from warp2protobuf.core.db import get_connection
 from warp2protobuf.core.account_selector import (
     AccountSelector,
     VALID_STRATEGIES,
@@ -110,7 +111,7 @@ class BatchUpdateStatusRequest(BaseModel):
 
 
 def _fetch_account_tokens(db_path: Path, account_id: int) -> dict[str, Any] | None:
-    with sqlite3.connect(str(db_path)) as conn:
+    with get_connection(str(db_path)) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute(
@@ -414,7 +415,7 @@ def _save_refreshed_token(account_id: int, new_token: str) -> None:
     """将刷新后的 token 写回数据库，更新 token_expires_at。"""
     try:
         expires_at = _extract_exp_from_jwt(new_token) or (time.time() + 3600)
-        with sqlite3.connect(ACCOUNT_DB_PATH) as conn:
+        with get_connection(ACCOUNT_DB_PATH) as conn:
             conn.execute(
                 "UPDATE accounts SET id_token = ?, token_expires_at = ?, updated_at = ? WHERE id = ?",
                 (new_token, expires_at, datetime.now().isoformat(), account_id),
@@ -527,7 +528,7 @@ async def batch_verify_quota() -> dict[str, Any]:
             remaining = quota_info.get("remaining", total_limit - used_limit)
 
             store.update_limit(account_id, total_limit, used_limit)
-            # 额度归零 → 标记 exhausted；有额度 → 恢复 available（无论之前是 exhausted/token_expired）
+            # 额度归零 → exhausted；有额度 + 非正常状态 → 恢复 available
             if remaining <= 0:
                 store.update_status(account_id, "exhausted")
             elif account.get("status") in ("exhausted", "token_expired") and remaining > 0:
@@ -615,8 +616,8 @@ async def verify_single_quota(account_id: int) -> dict[str, Any]:
         remaining = quota_info.get("remaining", total_limit - used_limit)
 
         store.update_limit(account_id, total_limit, used_limit)
-        # 额度归零 → 标记 exhausted；有额度 → 恢复 available（无论之前是 exhausted/token_expired）
-        current_status = row["status"] if "status" in row.keys() else None
+        # 额度归零 → exhausted；有额度 + 非正常状态 → 恢复 available
+        current_status = row.get("status")
         if remaining <= 0:
             store.update_status(account_id, "exhausted")
         elif current_status in ("exhausted", "token_expired") and remaining > 0:
@@ -676,7 +677,7 @@ async def force_refresh_single(account_id: int) -> dict[str, Any]:
 
         # 更新数据库
         expires_at = time.time() + 3600
-        with sqlite3.connect(ACCOUNT_DB_PATH) as conn:
+        with get_connection(ACCOUNT_DB_PATH) as conn:
             conn.execute(
                 "UPDATE accounts SET id_token = ?, token_expires_at = ?, updated_at = ? WHERE id = ?",
                 (new_id_token, expires_at, datetime.now().isoformat(), account_id),
@@ -936,13 +937,12 @@ async def _startup_prefresh_tokens(token_mgr: TokenManager) -> None:
 
     只刷新最多 3 个账号，每个间隔 3 秒，避免触发 Firebase 限流。
     """
-    import sqlite3 as _sqlite3
     from warp2protobuf.core.auth import is_token_expired, refresh_access_token_with_refresh_token
 
     max_prefresh = 3
     try:
-        with _sqlite3.connect(str(ACCOUNT_DB_PATH)) as conn:
-            conn.row_factory = _sqlite3.Row
+        with get_connection(str(ACCOUNT_DB_PATH)) as conn:
+            conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 "SELECT id, email, id_token, refresh_token FROM accounts "
                 "WHERE status = 'available' AND refresh_token IS NOT NULL AND refresh_token != '' "
@@ -1013,7 +1013,7 @@ async def _on_startup():
         logger.error("[Warp Bridge] Bridge server not ready at %s", url)
 
     try:
-        await asyncio.to_thread(initialize_once)
+        await initialize_once()
     except Exception as e:
         logger.warning("[Warp Bridge] Warmup initialize_once on startup failed: %s", e)
 

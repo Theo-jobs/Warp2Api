@@ -65,8 +65,9 @@ PATH_HINT_BONUS = ("conversation", "query", "input", "user", "request", "delta")
 SYSTEM_STR = {"agent_output.text", "server_message_data", "USER_INITIATED", "agent_output", "text"}
 
 # JWT refresh configuration
-REFRESH_TOKEN_B64 = "Z3JhbnRfdHlwZT1yZWZyZXNoX3Rva2VuJnJlZnJlc2hfdG9rZW49QU1mLXZCeFNSbWRodmVHR0JZTTY5cDA1a0RoSW4xaTd3c2NBTEVtQzlmWURScEh6akVSOWRMN2trLWtIUFl3dlk5Uk9rbXk1MHFHVGNJaUpaNEFtODZoUFhrcFZQTDkwSEptQWY1Zlo3UGVqeXBkYmNLNHdzbzhLZjNheGlTV3RJUk9oT2NuOU56R2FTdmw3V3FSTU5PcEhHZ0JyWW40SThrclc1N1I4X3dzOHU3WGNTdzh1MERpTDlIcnBNbTBMdHdzQ2g4MWtfNmJiMkNXT0ViMWxJeDNIV1NCVGVQRldzUQ=="
-REFRESH_URL = "https://app.warp.dev/proxy/token?key=AIzaSyBdy3O3S9hrdayLJxJ7mriBR4qgUaUygAs"
+REFRESH_TOKEN_B64 = os.getenv("WARP_REFRESH_TOKEN_B64", "")
+FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY", "")
+REFRESH_URL = f"https://app.warp.dev/proxy/token?key={FIREBASE_API_KEY}" if FIREBASE_API_KEY else ""
 
 # Account pool integration flags
 ACCOUNT_POOL_ENABLED = _env_bool("ACCOUNT_POOL_ENABLED", False)
@@ -125,5 +126,5 @@ ACCOUNT_SELECT_STRATEGY = os.getenv("ACCOUNT_SELECT_STRATEGY", "least_used")
 # Used by protobuf2openai routers when converting conversation history into system text.
 HISTORY_TOOL_RESULT_MAX_CHARS = min(
     100_000,
-    max(1, _env_int("HISTORY_TOOL_RESULT_MAX_CHARS", 100_000)),
+    max(1, _env_int("HISTORY_TOOL_RESULT_MAX_CHARS", 50_000)),
 )

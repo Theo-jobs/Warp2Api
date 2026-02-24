@@ -190,13 +190,9 @@ async def chat_completions(req: ChatCompletionsRequest, request: Request = None)
     else:
         logger.info("[OpenAI Compat] Using fallback JWT (original mechanism)")
 
-    # 在锁保护下设置 JWT 并初始化
-    async with token_mgr.env_lock:
-        original_jwt = os.environ.get("WARP_JWT", "")
-        os.environ["WARP_JWT"] = valid_token
-
+    # initialize_once 已在 startup 中完成，此处无需重复
     try:
-        initialize_once()
+        await initialize_once()
     except Exception as e:
         logger.warning(f"[OpenAI Compat] initialize_once failed or skipped: {e}")
 

@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from .db import get_connection
 from .logging import logger
 
 
@@ -24,7 +25,7 @@ class AccountStore:
         """确保数据库与表结构存在"""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        with sqlite3.connect(str(self.db_path)) as conn:
+        with get_connection(str(self.db_path)) as conn:
             cursor = conn.cursor()
 
             # 创建账号表（兼容已有结构）
@@ -74,7 +75,7 @@ class AccountStore:
 
     def upsert_account(self, account: Dict) -> int:
         """插入或更新账号（按 email 去重）"""
-        with sqlite3.connect(str(self.db_path)) as conn:
+        with get_connection(str(self.db_path)) as conn:
             cursor = conn.cursor()
 
             # 提取字段
@@ -138,7 +139,7 @@ class AccountStore:
         status: Optional[str] = None,
     ) -> Tuple[List[Dict], int]:
         """分页查询账号列表（脱敏）"""
-        with sqlite3.connect(str(self.db_path)) as conn:
+        with get_connection(str(self.db_path)) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
 
@@ -181,7 +182,7 @@ class AccountStore:
 
     def get_account_by_id(self, account_id: int) -> Optional[Dict]:
         """根据 ID 查询单个账号（脱敏）"""
-        with sqlite3.connect(str(self.db_path)) as conn:
+        with get_connection(str(self.db_path)) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
 
@@ -202,7 +203,7 @@ class AccountStore:
 
     def get_summary(self) -> Dict:
         """获取账号汇总统计"""
-        with sqlite3.connect(str(self.db_path)) as conn:
+        with get_connection(str(self.db_path)) as conn:
             cursor = conn.cursor()
 
             # 总数与状态计数
@@ -238,7 +239,7 @@ class AccountStore:
 
     def update_limit(self, account_id: int, total_limit: int, used_limit: int) -> bool:
         """更新账号额度"""
-        with sqlite3.connect(str(self.db_path)) as conn:
+        with get_connection(str(self.db_path)) as conn:
             cursor = conn.cursor()
 
             now = datetime.now().isoformat()
@@ -259,7 +260,7 @@ class AccountStore:
         if status not in ("available", "disabled", "exhausted", "token_expired"):
             raise ValueError(f"Invalid status: {status!r}, must be 'available', 'disabled', 'exhausted' or 'token_expired'")
 
-        with sqlite3.connect(str(self.db_path)) as conn:
+        with get_connection(str(self.db_path)) as conn:
             cursor = conn.cursor()
             now = datetime.now().isoformat()
             cursor.execute(
@@ -277,7 +278,7 @@ class AccountStore:
         if not account_ids:
             return 0
 
-        with sqlite3.connect(str(self.db_path)) as conn:
+        with get_connection(str(self.db_path)) as conn:
             cursor = conn.cursor()
             now = datetime.now().isoformat()
             placeholders = ",".join("?" for _ in account_ids)
@@ -297,7 +298,7 @@ class AccountStore:
         Returns:
             实际更新的行数。
         """
-        with sqlite3.connect(str(self.db_path)) as conn:
+        with get_connection(str(self.db_path)) as conn:
             cursor = conn.cursor()
             now = datetime.now().isoformat()
             if account_ids:
@@ -316,7 +317,7 @@ class AccountStore:
 
     def delete_account(self, account_id: int) -> bool:
         """删除单个账号。"""
-        with sqlite3.connect(str(self.db_path)) as conn:
+        with get_connection(str(self.db_path)) as conn:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
             conn.commit()
@@ -329,7 +330,7 @@ class AccountStore:
         """批量删除账号，返回实际删除数量。"""
         if not account_ids:
             return 0
-        with sqlite3.connect(str(self.db_path)) as conn:
+        with get_connection(str(self.db_path)) as conn:
             cursor = conn.cursor()
             placeholders = ",".join("?" for _ in account_ids)
             cursor.execute(

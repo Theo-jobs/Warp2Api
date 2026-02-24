@@ -85,15 +85,15 @@ class TokenManager:
     async def get_valid_token(self, account: Dict) -> Optional[str]:
         """获取账号的有效 id_token，过期则自动刷新。
 
-        - Firebase 全局限流期间：直接返回已有 token（即使过期），不尝试刷新
-        - 单账号冷却期间：跳过该账号
+        - Firebase 全局限流期间：仅返回未过期的 token，过期则返回 None（让调用方换号）
+        - 单账号冷却期间：仅返回未过期的 token，过期则返回 None
         - 正常情况：过期则刷新
 
         Args:
             account: 从 DB 查出的账号字典，需包含 id, id_token, refresh_token, email
 
         Returns:
-            有效的 id_token；刷新失败时返回已有 token（可能过期）或 None
+            有效的 id_token；无法获取有效 token 时返回 None
         """
         account_id = account["id"]
         id_token = account.get("id_token", "")
@@ -103,22 +103,24 @@ class TokenManager:
         if id_token and not is_token_expired(id_token, buffer_minutes=5):
             return id_token
 
-        # === Firebase 全局限流期间：返回已有 token，不刷新 ===
+        # === Firebase 全局限流期间：过期 token 不返回，让调用方换号重试 ===
         if self.is_firebase_blocked():
-            if id_token:
-                logger.debug(
-                    "[TokenManager] Firebase 限流中，account_id=%d 返回已有 token（可能过期）",
-                    account_id,
-                )
-                return id_token
+            remaining = int((self._firebase_blocked_until - time.time()) / 60)
+            logger.warning(
+                "[TokenManager] Firebase 限流中（剩余 %d 分钟），account_id=%d token 已过期，返回 None 让调用方换号",
+                remaining,
+                account_id,
+            )
             return None
 
         # 检查单账号冷却期
         fail_ts = self._refresh_failures.get(account_id, 0)
         if fail_ts and (time.time() - fail_ts) < self._FAILURE_COOLDOWN:
-            # 冷却期内也返回已有 token
-            if id_token:
-                return id_token
+            # 冷却期内不返回过期 token
+            logger.debug(
+                "[TokenManager] account_id=%d 在冷却期，token 已过期，返回 None",
+                account_id,
+            )
             return None
 
         # token 过期或为空，需要刷新
@@ -165,8 +167,8 @@ class TokenManager:
             if "429" in err_msg or "rate" in err_msg.lower():
                 self.set_firebase_blocked()
 
-            # 返回已有 token（过期也比 None 好，让 bridge 层尝试处理）
-            return id_token or None
+            # 刷新失败 → 返回 None，让调用方换号重试，不再返回过期 token
+            return None
 
     def _update_token_in_db(self, account_id: int, new_token: str) -> None:
         """将刷新后的 token 和过期时间回写数据库。"""

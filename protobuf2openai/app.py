@@ -30,6 +30,7 @@ from warp2protobuf.config.settings import (
     ACCOUNT_DB_PATH,
     ACCOUNT_ADMIN_ENABLED,
     ACCOUNT_REGISTER_ENABLED,
+    ACCOUNT_SELECT_STRATEGY,
 )
 from warp2protobuf.core.account_store import AccountStore
 from warp2protobuf.core.account_selector import AccountSelector
@@ -413,10 +414,16 @@ async def _resolve_quota_with_token_strategy(
     token = ""
     from_id_token = False
 
+    # 检查 Firebase 全局限流，避免绕过 TokenManager 直接触发 429
+    token_mgr = TokenManager.get_instance(ACCOUNT_DB_PATH)
+    firebase_blocked = token_mgr.is_firebase_blocked()
+
     if id_token and not is_token_expired(id_token, buffer_minutes=0):
         token = id_token
         from_id_token = True
     elif refresh_token:
+        if firebase_blocked:
+            raise RuntimeError("Firebase 全局限流中，无法刷新 token 查询额度，请稍后重试")
         token = await refresh_access_token_with_refresh_token(refresh_token)
     else:
         raise RuntimeError("missing valid id_token and refresh_token")
@@ -425,6 +432,8 @@ async def _resolve_quota_with_token_strategy(
         return await get_request_limit_info(token)
     except Exception as first_error:
         if from_id_token and refresh_token and _is_auth_error(first_error):
+            if firebase_blocked:
+                raise RuntimeError("Firebase 全局限流中，无法刷新 token 重试额度查询") from first_error
             refreshed_token = await refresh_access_token_with_refresh_token(refresh_token)
             return await get_request_limit_info(refreshed_token)
         raise
@@ -435,6 +444,15 @@ async def batch_verify_quota() -> dict[str, Any]:
     """批量验证所有账号的真实额度（GraphQL GetRequestLimitInfo）"""
     if not ACCOUNT_ADMIN_ENABLED:
         raise HTTPException(status_code=403, detail="Account management is disabled")
+
+    # 检查 Firebase 全局限流
+    token_mgr = TokenManager.get_instance(ACCOUNT_DB_PATH)
+    if token_mgr.is_firebase_blocked():
+        remaining = int((TokenManager._firebase_blocked_until - time.time()) / 60)
+        return {
+            "success": False,
+            "error": f"Firebase 全局限流中，剩余冷却 {remaining} 分钟，请稍后重试",
+        }
 
     store = AccountStore(ACCOUNT_DB_PATH)
     accounts, total = store.get_accounts(page=1, page_size=500)
@@ -492,6 +510,18 @@ async def batch_verify_quota() -> dict[str, Any]:
                 store.update_status(account_id, "disabled")
             elif _is_transient_error(e):
                 logger.warning("[VerifyQuota] transient error account_id=%s: %s", account_id, error_msg)
+            # 检测 429 → 触发全局限流并中断批量操作
+            if "429" in error_msg or "rate" in error_msg.lower():
+                token_mgr = TokenManager.get_instance(ACCOUNT_DB_PATH)
+                token_mgr.set_firebase_blocked()
+                logger.error("[VerifyQuota] 检测到 429 限流，中断批量验证")
+                results["details"].append({
+                    "id": account_id,
+                    "email": email,
+                    "valid": False,
+                    "error": error_msg,
+                })
+                break
             results["details"].append({
                 "id": account_id,
                 "email": email,
@@ -583,10 +613,13 @@ async def get_feature_flags() -> dict[str, Any]:
     """返回前端可见的功能开关状态。"""
     return {
         "success": True,
-        "features": FeatureFlagsResponse(
-            account_admin_enabled=ACCOUNT_ADMIN_ENABLED,
-            account_register_enabled=ACCOUNT_REGISTER_ENABLED,
-        ).model_dump(),
+        "features": {
+            **FeatureFlagsResponse(
+                account_admin_enabled=ACCOUNT_ADMIN_ENABLED,
+                account_register_enabled=ACCOUNT_REGISTER_ENABLED,
+            ).model_dump(),
+            "account_select_strategy": ACCOUNT_SELECT_STRATEGY,
+        },
     }
 
 
@@ -719,6 +752,61 @@ async def get_system_stats() -> dict[str, Any]:
         }
 
 
+async def _startup_prefresh_tokens(token_mgr: TokenManager) -> None:
+    """启动时预刷新前几个过期账号的 token，确保服务就绪时有可用 token。
+
+    只刷新最多 3 个账号，每个间隔 3 秒，避免触发 Firebase 限流。
+    """
+    import sqlite3 as _sqlite3
+    from warp2protobuf.core.auth import is_token_expired, refresh_access_token_with_refresh_token
+
+    max_prefresh = 3
+    try:
+        with _sqlite3.connect(str(ACCOUNT_DB_PATH)) as conn:
+            conn.row_factory = _sqlite3.Row
+            rows = conn.execute(
+                "SELECT id, email, id_token, refresh_token FROM accounts "
+                "WHERE status = 'available' AND refresh_token IS NOT NULL AND refresh_token != '' "
+                "LIMIT 20"
+            ).fetchall()
+    except Exception as e:
+        logger.warning("[StartupPrefresh] 读取账号失败: %s", e)
+        return
+
+    refreshed = 0
+    for row in rows:
+        if refreshed >= max_prefresh:
+            break
+        account = dict(row)
+        id_token = account.get("id_token", "")
+        # 只刷新已过期的
+        if id_token and not is_token_expired(id_token, buffer_minutes=5):
+            continue
+        refresh_token = account.get("refresh_token", "")
+        if not refresh_token:
+            continue
+        try:
+            logger.info(
+                "[StartupPrefresh] 预刷新 account_id=%d email=%s",
+                account["id"], account.get("email", "?"),
+            )
+            new_token = await refresh_access_token_with_refresh_token(refresh_token)
+            if new_token:
+                token_mgr._update_token_in_db(account["id"], new_token)
+                refreshed += 1
+                logger.info("[StartupPrefresh] account_id=%d 刷新成功", account["id"])
+        except Exception as exc:
+            err_msg = str(exc)
+            logger.warning("[StartupPrefresh] account_id=%d 刷新失败: %s", account["id"], exc)
+            if "429" in err_msg or "rate" in err_msg.lower():
+                token_mgr.set_firebase_blocked()
+                logger.error("[StartupPrefresh] 遇到 429 限流，停止预刷新")
+                break
+        await asyncio.sleep(3)
+
+    logger.info("[StartupPrefresh] 启动预刷新完成，刷新了 %d 个账号", refreshed)
+
+
 @app.on_event("startup")
 async def _on_startup():
     try:
@@ -754,9 +842,15 @@ async def _on_startup():
     # 不再启动时自动刷新，避免 Firebase 限流
     logger.info("[Warp Bridge] Token 批量刷新已关闭自动启动，如需刷新请调用 POST /api/tokens/refresh")
 
+    # 启动时预刷新前几个账号的 token，确保服务就绪时有可用 token
+    token_mgr = TokenManager.get_instance(ACCOUNT_DB_PATH)
+    try:
+        await _startup_prefresh_tokens(token_mgr)
+    except Exception as e:
+        logger.warning("[Warp Bridge] 启动预刷新失败: %s", e)
+
     # 启动后台预刷新：每 5 分钟检查即将过期的 token，提前 10 分钟刷新
     # 这是轻量级的，只刷新快到期的，不会一次性刷新所有账号
-    token_mgr = TokenManager.get_instance(ACCOUNT_DB_PATH)
     token_mgr.start_background_refresh()
 
 

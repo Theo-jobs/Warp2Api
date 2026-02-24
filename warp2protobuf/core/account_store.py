@@ -58,6 +58,7 @@ class AccountStore:
                 "used_limit": "INTEGER DEFAULT 0",
                 "last_check": "TIMESTAMP",
                 "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+                "token_expires_at": "REAL DEFAULT 0",
             }
 
             for col_name, col_def in new_columns.items():
@@ -167,7 +168,8 @@ class AccountStore:
                     total_limit, used_limit,
                     (total_limit - used_limit) as remaining_limit,
                     last_check, use_count, last_used,
-                    created_at, updated_at
+                    created_at, updated_at,
+                    token_expires_at
                 FROM accounts
                 {where_sql}
                 ORDER BY created_at DESC
@@ -189,7 +191,8 @@ class AccountStore:
                     total_limit, used_limit,
                     (total_limit - used_limit) as remaining_limit,
                     last_check, use_count, last_used,
-                    created_at, updated_at
+                    created_at, updated_at,
+                    token_expires_at
                 FROM accounts
                 WHERE id = ?
             """, (account_id,))

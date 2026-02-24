@@ -117,6 +117,10 @@ ACCOUNT_DB_PATH = os.getenv("ACCOUNT_DB_PATH", str(SCRIPT_DIR / "accounts.db"))
 ACCOUNT_ADMIN_ENABLED = _env_bool("ACCOUNT_ADMIN_ENABLED", True)
 ACCOUNT_REGISTER_ENABLED = _env_bool("ACCOUNT_REGISTER_ENABLED", False)
 
+# Account selection strategy
+# Options: least_used, round_robin, random, most_quota, priority
+ACCOUNT_SELECT_STRATEGY = os.getenv("ACCOUNT_SELECT_STRATEGY", "least_used")
+
 # History serialization truncation length for tool results
 # Used by protobuf2openai routers when converting conversation history into system text.
 HISTORY_TOOL_RESULT_MAX_CHARS = min(

@@ -141,7 +141,10 @@
             background: white;
             padding: 12px 15px;
             border-radius: 8px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            box-shadow: 0 -2px 8px rgba(0,0,0,0.12);
+            position: sticky;
+            bottom: 10px;
+            z-index: 50;
             margin-top: 15px;
             align-items: center;
             gap: 12px;
@@ -207,6 +210,14 @@
             color: #9ca3af;
             font-style: italic;
         }
+
+        /* Token 过期时间 */
+        .token-expiry { font-size: 12px; white-space: nowrap; }
+        .token-expiry.expired { color: #dc3545; font-weight: 600; }
+        .token-expiry.warning { color: #fd7e14; }
+        .token-expiry.ok { color: #28a745; }
+        .token-expiry.unknown { color: #adb5bd; }
+        .token-expiry-sub { font-size: 11px; color: #999; margin-top: 2px; }
         .quota-next-refresh {
             font-size: 11px;
             color: #9ca3af;
@@ -273,6 +284,11 @@
                 <div class="card-value" id="remaining-limit">-</div>
                 <div class="card-subtitle" id="usage-percent">-</div>
             </div>
+            <div class="card">
+                <div class="card-title">选择策略</div>
+                <div class="card-value" id="select-strategy" style="font-size: 16px;">-</div>
+                <div class="card-subtitle" id="strategy-desc">-</div>
+            </div>
         </div>
 
         <div class="card" style="margin-bottom: 20px;">
@@ -330,6 +346,7 @@
                     <th>Local ID</th>
                     <th>状态</th>
                     <th>额度</th>
+                    <th>Token 过期</th>
                     <th>使用次数</th>
                     <th>最后检查</th>
                     <th>操作</th>
@@ -342,8 +359,12 @@
 
         <div class="batch-bar" id="batch-bar">
             <span class="selected-count" id="selected-count">已选 0 个</span>
-            <button class="btn-enable btn-sm" onclick="batchUpdateStatus('available')">批量启用</button>
-            <button class="btn-disable btn-sm" onclick="batchUpdateStatus('disabled')">批量禁用</button>
+            <button class="btn-enable btn-sm" onclick="batchUpdateStatus('available')">✅ 批量启用</button>
+            <button class="btn-disable btn-sm" onclick="batchUpdateStatus('disabled')">🚫 批量禁用</button>
+            <span style="color:#ccc;">|</span>
+            <button class="btn-sm btn-secondary" onclick="selectByStatus('available')">选中所有可用</button>
+            <button class="btn-sm btn-secondary" onclick="selectByStatus('disabled')">选中所有禁用</button>
+            <button class="btn-sm" style="background:#6c757d;" onclick="clearSelection()">取消选择</button>
         </div>
     </div>
 
@@ -479,6 +500,17 @@
                     const pool = poolData.status;
                     document.getElementById('exhausted-count').textContent =
                         `额度耗尽: ${pool.exhausted}`;
+
+                    const strategy = pool.strategy || 'least_used';
+                    const strategyNames = {
+                        'least_used': '最少使用优先',
+                        'round_robin': '轮询',
+                        'random': '随机',
+                        'most_quota': '最多额度优先',
+                        'priority': '优先级'
+                    };
+                    document.getElementById('select-strategy').textContent = strategyNames[strategy] || strategy;
+                    document.getElementById('strategy-desc').textContent = `ACCOUNT_SELECT_STRATEGY=${strategy}`;
                 }
 
                 // 显示最近使用的账号
@@ -621,6 +653,7 @@
                     <td>${escapeHtml(localIdText)}</td>
                     <td><span class="status-badge status-${statusValue}">${statusValue}</span></td>
                     <td>${renderQuotaCell(account)}</td>
+                    <td>${renderTokenExpiry(account.token_expires_at)}</td>
                     <td>${account.use_count || 0}</td>
                     <td>${account.last_check ? new Date(account.last_check).toLocaleString('zh-CN') : '-'}</td>
                     <td>
@@ -672,6 +705,33 @@
             setTimeout(() => {
                 successDiv.style.display = 'none';
             }, 5000);
+        }
+
+        // 渲染 Token 过期时间
+        function renderTokenExpiry(expiresAt) {
+            if (!expiresAt || expiresAt <= 0) {
+                return '<span class="token-expiry unknown">未知</span>';
+            }
+            const now = Date.now() / 1000;
+            const diff = expiresAt - now;
+            const expiryDate = new Date(expiresAt * 1000);
+            const timeStr = expiryDate.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+
+            if (diff <= 0) {
+                const agoMin = Math.abs(Math.floor(diff / 60));
+                const agoText = agoMin < 60 ? `${agoMin}分钟前` : `${Math.floor(agoMin / 60)}小时前`;
+                return `<div><span class="token-expiry expired">已过期</span><div class="token-expiry-sub">${agoText}过期</div></div>`;
+            } else if (diff < 600) {
+                const minLeft = Math.floor(diff / 60);
+                return `<div><span class="token-expiry expired">${minLeft}分钟</span><div class="token-expiry-sub">${timeStr}</div></div>`;
+            } else if (diff < 1800) {
+                const minLeft = Math.floor(diff / 60);
+                return `<div><span class="token-expiry warning">${minLeft}分钟</span><div class="token-expiry-sub">${timeStr}</div></div>`;
+            } else {
+                const minLeft = Math.floor(diff / 60);
+                const display = minLeft >= 60 ? `${Math.floor(minLeft / 60)}h${minLeft % 60}m` : `${minLeft}分钟`;
+                return `<div><span class="token-expiry ok">${display}</span><div class="token-expiry-sub">${timeStr}</div></div>`;
+            }
         }
 
         // 渲染额度单元格
@@ -948,12 +1008,30 @@
             const ids = getSelectedIds();
             const bar = document.getElementById('batch-bar');
             const countEl = document.getElementById('selected-count');
+            bar.classList.add('visible');
             if (ids.length > 0) {
-                bar.classList.add('visible');
                 countEl.textContent = `已选 ${ids.length} 个`;
             } else {
-                bar.classList.remove('visible');
+                countEl.textContent = '未选择';
             }
+        }
+
+        function selectByStatus(targetStatus) {
+            const rows = document.querySelectorAll('#accounts-body tr');
+            rows.forEach(row => {
+                const badge = row.querySelector('.status-badge');
+                const cb = row.querySelector('.row-checkbox');
+                if (badge && cb) {
+                    cb.checked = badge.textContent.trim() === targetStatus;
+                }
+            });
+            updateBatchBar();
+        }
+
+        function clearSelection() {
+            document.querySelectorAll('.row-checkbox').forEach(cb => { cb.checked = false; });
+            document.getElementById('select-all').checked = false;
+            updateBatchBar();
         }
 
         async function batchUpdateStatus(newStatus) {

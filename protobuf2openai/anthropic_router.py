@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import sqlite3
+import time
 import uuid
 from typing import Any
 
@@ -213,16 +214,31 @@ def _build_warp_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
                 })
 
         elif role == "user":
-            # Check for tool_result blocks
+            # Check for tool_result / text / image blocks
             if isinstance(content, list):
                 tool_results: list[dict[str, Any]] = []
                 text_parts_u: list[str] = []
+                image_segments: list[dict[str, Any]] = []
                 for block in content:
                     if isinstance(block, dict):
                         if block.get("type") == "tool_result":
                             tool_results.append(block)
                         elif block.get("type") == "text":
                             text_parts_u.append(block.get("text", ""))
+                        elif block.get("type") == "image":
+                            # Convert Anthropic image block to OpenAI image_url format
+                            # so downstream extract_images_from_segments() can pick it up
+                            source = block.get("source", {})
+                            if isinstance(source, dict) and source.get("type") == "base64":
+                                media_type = source.get("media_type", "image/png")
+                                data = source.get("data", "")
+                                if data:
+                                    image_segments.append({
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": f"data:{media_type};base64,{data}"
+                                        },
+                                    })
                     elif isinstance(block, str):
                         text_parts_u.append(block)
 
@@ -235,12 +251,22 @@ def _build_warp_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
                         "content": inner,
                     })
 
-                # Also emit any remaining text as a user message
-                if text_parts_u:
-                    warp_msgs.append({
-                        "role": "user",
-                        "content": "\n".join(text_parts_u),
-                    })
+                # Emit user message; use list format when images are present
+                if text_parts_u or image_segments:
+                    if image_segments:
+                        user_content: list[dict[str, Any]] = []
+                        if text_parts_u:
+                            user_content.append({"type": "text", "text": "\n".join(text_parts_u)})
+                        user_content.extend(image_segments)
+                        warp_msgs.append({
+                            "role": "user",
+                            "content": user_content,
+                        })
+                    else:
+                        warp_msgs.append({
+                            "role": "user",
+                            "content": "\n".join(text_parts_u),
+                        })
             else:
                 warp_msgs.append({
                     "role": "user",
@@ -500,6 +526,12 @@ async def anthropic_messages(request: Request) -> Any:
 
     account = selector.select_account()
     if not account:
+        if token_mgr.is_firebase_blocked():
+            remaining = int((TokenManager._firebase_blocked_until - time.time()) / 60)
+            raise HTTPException(
+                status_code=503,
+                detail=f"All account tokens expired (Firebase rate limited), cooldown {remaining} min remaining",
+            )
         raise HTTPException(status_code=503, detail="No available account with remaining quota")
 
     access_token = await token_mgr.get_valid_token(account)
@@ -529,6 +561,12 @@ async def anthropic_messages(request: Request) -> Any:
             logger.warning("[Anthropic] Fallback get_valid_jwt() failed: %s", exc)
 
     if not access_token:
+        if token_mgr.is_firebase_blocked():
+            remaining = int((TokenManager._firebase_blocked_until - time.time()) / 60)
+            raise HTTPException(
+                status_code=503,
+                detail=f"All token refresh attempts failed (Firebase rate limited), cooldown {remaining} min remaining",
+            )
         raise HTTPException(status_code=503, detail="No valid token available")
 
     account_id = account["id"] if account else 0

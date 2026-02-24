@@ -480,6 +480,11 @@ async def stream_anthropic_sse(
                 for p in _finalize(state):
                     yield p
 
+                # 内部元数据信号：让外层知道 finish_reason（不是 SSE 事件，以 \x00 开头）
+                if state.finish_reason and isinstance(state.finish_reason, dict):
+                    if "quota_limit" in state.finish_reason or "quotaLimit" in state.finish_reason:
+                        yield "\x00__QUOTA_LIMIT__"
+
     except httpx.ConnectError as exc:
         logger.error("[anthropic_sse] connect error: %s", exc)
         state_fresh = AnthropicSseState(model=model)

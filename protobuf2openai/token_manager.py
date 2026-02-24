@@ -175,6 +175,8 @@ class TokenManager:
                     "[TokenManager] account_id=%d token 刷新成功",
                     account_id,
                 )
+                # 异步同步额度（不阻塞请求热路径）
+                asyncio.create_task(self.sync_account_quota(account_id, new_token))
                 return new_token
 
         except Exception as exc:
@@ -225,6 +227,61 @@ class TokenManager:
             account_id,
             self._FAILURE_COOLDOWN,
         )
+
+    def mark_account_exhausted(self, account_id: int) -> None:
+        """标记账号额度耗尽，设置 status='exhausted' 从选择池中剔除。"""
+        try:
+            with sqlite3.connect(str(self.db_path)) as conn:
+                now = datetime.now().isoformat()
+                conn.execute(
+                    "UPDATE accounts SET status = 'exhausted', updated_at = ? WHERE id = ?",
+                    (now, account_id),
+                )
+                conn.commit()
+            logger.warning(
+                "[TokenManager] account_id=%d 额度耗尽，已标记为 exhausted",
+                account_id,
+            )
+        except Exception as exc:
+            logger.error(
+                "[TokenManager] account_id=%d 标记 exhausted 失败: %s",
+                account_id, exc,
+            )
+
+    async def sync_account_quota(self, account_id: int, access_token: str) -> None:
+        """查询 Warp 服务端真实额度并同步到本地 DB。"""
+        try:
+            from warp2protobuf.core.quota import get_request_limit_info
+            quota = await get_request_limit_info(access_token)
+            total = quota.get("request_limit", 0)
+            used = quota.get("used", 0)
+            remaining = quota.get("remaining", 0)
+
+            with sqlite3.connect(str(self.db_path)) as conn:
+                now = datetime.now().isoformat()
+                conn.execute(
+                    """UPDATE accounts SET
+                        total_limit = ?, used_limit = ?, last_check = ?, updated_at = ?
+                    WHERE id = ?""",
+                    (total, used, now, now, account_id),
+                )
+                conn.commit()
+
+            logger.info(
+                "[TokenManager] account_id=%d 额度已同步: total=%d used=%d remaining=%d",
+                account_id, total, used, remaining,
+            )
+
+            # 额度耗尽则自动标记 exhausted
+            if remaining <= 0:
+                self.mark_account_exhausted(account_id)
+
+        except Exception as exc:
+            # 额度查询失败不影响主流程，仅记录日志
+            logger.warning(
+                "[TokenManager] account_id=%d 额度同步失败（不影响 token 刷新）: %s",
+                account_id, exc,
+            )
 
     @property
     def env_lock(self) -> asyncio.Lock:
@@ -340,6 +397,13 @@ class TokenManager:
                 next_interval = max(60, min(600, next_interval))
             except Exception as e:
                 logger.error("[TokenManager] 后台预刷新异常: %s", e)
+
+            # 定期检查 exhausted 账号是否额度已恢复
+            try:
+                await self._check_exhausted_accounts()
+            except Exception as e:
+                logger.error("[TokenManager] exhausted 恢复检查异常: %s", e)
+
             await asyncio.sleep(next_interval)
 
     async def _refresh_expiring_tokens(self) -> int:
@@ -431,6 +495,8 @@ class TokenManager:
                     self._update_token_in_db(account_id, new_token)
                     self._refresh_failures.pop(account_id, None)
                     refreshed += 1
+                    # 刷新成功后顺带同步服务端真实额度
+                    await self.sync_account_quota(account_id, new_token)
             except Exception as exc:
                 err_msg = str(exc)
                 logger.warning(
@@ -472,6 +538,111 @@ class TokenManager:
         except Exception:
             pass
         return 300  # 默认 5 分钟
+
+    async def _check_exhausted_accounts(self) -> None:
+        """渐进式检查 exhausted 账号，如果服务端额度已恢复则自动重新启用。
+
+        策略：
+        - 每次后台循环都会调用，但只查 updated_at 距今 ≥4 小时的（刚耗尽的不查）
+        - 每次最多查 2 个（按 updated_at ASC，最久没检查的优先）
+        - 查完更新 updated_at，下次循环自然轮到下一批
+        """
+        if self.is_firebase_blocked():
+            return
+
+        min_age = time.time() - 4 * 3600  # 至少 4 小时前标记/检查的才查
+
+        with sqlite3.connect(str(self.db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """SELECT id, email, refresh_token, updated_at
+                   FROM accounts
+                   WHERE status = 'exhausted'
+                     AND refresh_token IS NOT NULL AND refresh_token != ''
+                     AND (updated_at IS NULL OR updated_at < ?)
+                   ORDER BY updated_at ASC
+                   LIMIT 2""",
+                (datetime.fromtimestamp(min_age).isoformat(),),
+            ).fetchall()
+
+        if not rows:
+            return
+
+        logger.info("[TokenManager] 渐进检查 %d 个 exhausted 账号", len(rows))
+        recovered = 0
+
+        for row in rows:
+            if self.is_firebase_blocked():
+                break
+
+            account_id = row["id"]
+            refresh_token = row["refresh_token"]
+
+            try:
+                # 先刷新 token（exhausted 账号的 token 大概率已过期）
+                new_token = await refresh_access_token_with_refresh_token(refresh_token)
+                if not new_token:
+                    # 刷新失败也更新 updated_at，避免反复重试同一个
+                    self._touch_updated_at(account_id)
+                    continue
+
+                self._update_token_in_db(account_id, new_token)
+
+                # 查询服务端真实额度
+                from warp2protobuf.core.quota import get_request_limit_info
+                quota = await get_request_limit_info(new_token)
+                total = quota.get("request_limit", 0)
+                used = quota.get("used", 0)
+                remaining = quota.get("remaining", 0)
+
+                now_str = datetime.now().isoformat()
+                with sqlite3.connect(str(self.db_path)) as conn:
+                    conn.execute(
+                        """UPDATE accounts SET
+                            total_limit = ?, used_limit = ?, last_check = ?, updated_at = ?
+                        WHERE id = ?""",
+                        (total, used, now_str, now_str, account_id),
+                    )
+                    if remaining > 0:
+                        conn.execute(
+                            "UPDATE accounts SET status = 'available', updated_at = ? WHERE id = ?",
+                            (now_str, account_id),
+                        )
+                        recovered += 1
+                        logger.info(
+                            "[TokenManager] account_id=%d email=%s 额度已恢复 (remaining=%d)，重新启用",
+                            account_id, row["email"], remaining,
+                        )
+                    conn.commit()
+
+            except Exception as exc:
+                err_msg = str(exc)
+                logger.warning(
+                    "[TokenManager] exhausted account_id=%d 恢复检查失败: %s",
+                    account_id, exc,
+                )
+                # 失败也更新 updated_at，避免卡在同一个账号
+                self._touch_updated_at(account_id)
+                if "429" in err_msg or "rate" in err_msg.lower():
+                    self.set_firebase_blocked()
+                    break
+
+            await asyncio.sleep(3)
+
+        if recovered > 0:
+            logger.info("[TokenManager] exhausted 恢复检查完成，恢复 %d 个账号", recovered)
+
+    def _touch_updated_at(self, account_id: int) -> None:
+        """仅更新 updated_at，用于推后下次检查时间。"""
+        try:
+            with sqlite3.connect(str(self.db_path)) as conn:
+                conn.execute(
+                    "UPDATE accounts SET updated_at = ? WHERE id = ?",
+                    (datetime.now().isoformat(), account_id),
+                )
+                conn.commit()
+        except Exception:
+            pass
 
 
 def _extract_exp_from_jwt(token: str) -> float:

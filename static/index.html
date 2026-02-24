@@ -86,6 +86,13 @@
         }
         .status-available { background: #d4edda; color: #155724; }
         .status-disabled { background: #f8d7da; color: #721c24; }
+        .status-exhausted { background: #fff3cd; color: #856404; }
+
+        th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+        th.sortable:hover { background: #e9ecef; }
+        th.sortable .sort-arrow { margin-left: 4px; font-size: 10px; color: #999; }
+        th.sortable.sort-asc .sort-arrow::after { content: '▲'; color: #333; }
+        th.sortable.sort-desc .sort-arrow::after { content: '▼'; color: #333; }
 
         .pagination {
             display: flex;
@@ -311,6 +318,7 @@
                 <option value="">全部状态</option>
                 <option value="available">可用</option>
                 <option value="disabled">已禁用</option>
+                <option value="exhausted">额度耗尽</option>
             </select>
             <button onclick="loadAccounts()">🔍 搜索</button>
             <button onclick="loadSummary()">🔄 刷新</button>
@@ -349,14 +357,14 @@
             <thead>
                 <tr>
                     <th><input type="checkbox" id="select-all" onclick="toggleSelectAll(this)"></th>
-                    <th>ID</th>
+                    <th class="sortable" data-key="id" onclick="sortTable('id')">ID<span class="sort-arrow"></span></th>
                     <th>邮箱</th>
                     <th>Local ID</th>
-                    <th>状态</th>
-                    <th>额度</th>
-                    <th>Token 过期</th>
-                    <th>使用次数</th>
-                    <th>最后检查</th>
+                    <th class="sortable" data-key="status" onclick="sortTable('status')">状态<span class="sort-arrow"></span></th>
+                    <th class="sortable" data-key="remaining_limit" onclick="sortTable('remaining_limit')">额度<span class="sort-arrow"></span></th>
+                    <th class="sortable" data-key="token_expires_at" onclick="sortTable('token_expires_at')">Token 过期<span class="sort-arrow"></span></th>
+                    <th class="sortable" data-key="use_count" onclick="sortTable('use_count')">使用次数<span class="sort-arrow"></span></th>
+                    <th class="sortable" data-key="last_check" onclick="sortTable('last_check')">最后检查<span class="sort-arrow"></span></th>
                     <th>操作</th>
                 </tr>
             </thead>
@@ -605,7 +613,9 @@
         }
 
         function normalizeStatus(status) {
-            return status === 'disabled' ? 'disabled' : 'available';
+            if (status === 'disabled') return 'disabled';
+            if (status === 'exhausted') return 'exhausted';
+            return 'available';
         }
 
         function renderRecentAccounts(accounts) {
@@ -626,7 +636,52 @@
             listEl.style.whiteSpace = 'pre-line';
         }
 
-        function renderAccounts(accounts) {
+        // ---- 排序状态 ----
+        let currentSortKey = '';
+        let currentSortDir = ''; // 'asc' | 'desc' | ''
+        let lastAccountsData = []; // 缓存当前页数据用于前端排序
+
+        function sortTable(key) {
+            if (currentSortKey === key) {
+                // 同列循环：asc → desc → 无
+                if (currentSortDir === 'asc') currentSortDir = 'desc';
+                else if (currentSortDir === 'desc') { currentSortDir = ''; currentSortKey = ''; }
+                else currentSortDir = 'asc';
+            } else {
+                currentSortKey = key;
+                currentSortDir = 'asc';
+            }
+            // 更新表头样式
+            document.querySelectorAll('th.sortable').forEach(th => {
+                th.classList.remove('sort-asc', 'sort-desc');
+                if (th.dataset.key === currentSortKey && currentSortDir) {
+                    th.classList.add('sort-' + currentSortDir);
+                }
+            });
+            // 前端排序当前页数据
+            const sorted = [...lastAccountsData];
+            if (currentSortKey && currentSortDir) {
+                sorted.sort((a, b) => {
+                    let va = a[currentSortKey], vb = b[currentSortKey];
+                    // null / undefined 排最后
+                    if (va == null && vb == null) return 0;
+                    if (va == null) return 1;
+                    if (vb == null) return -1;
+                    // 数字比较
+                    if (typeof va === 'number' && typeof vb === 'number') {
+                        return currentSortDir === 'asc' ? va - vb : vb - va;
+                    }
+                    // 字符串比较
+                    va = String(va); vb = String(vb);
+                    const cmp = va.localeCompare(vb);
+                    return currentSortDir === 'asc' ? cmp : -cmp;
+                });
+            }
+            renderAccounts(sorted, true);
+        }
+
+        function renderAccounts(accounts, skipCache) {
+            if (!skipCache) lastAccountsData = accounts;
             const tbody = document.getElementById('accounts-body');
             tbody.innerHTML = '';
             document.getElementById('select-all').checked = false;
@@ -642,9 +697,11 @@
                 tr.id = `account-row-${accountId}`;
                 const statusValue = normalizeStatus(account.status);
                 const isDisabled = statusValue === 'disabled';
-                const toggleBtnClass = isDisabled ? 'btn-enable' : 'btn-disable';
-                const toggleBtnText = isDisabled ? '启用' : '禁用';
-                const toggleTarget = isDisabled ? 'available' : 'disabled';
+                const isExhausted = statusValue === 'exhausted';
+                const toggleBtnClass = (isDisabled || isExhausted) ? 'btn-enable' : 'btn-disable';
+                const toggleBtnText = (isDisabled || isExhausted) ? '启用' : '禁用';
+                const toggleTarget = (isDisabled || isExhausted) ? 'available' : 'disabled';
+                const statusLabel = isExhausted ? '额度耗尽' : statusValue;
                 const localIdText = typeof account.local_id === 'string' && account.local_id
                     ? `${account.local_id.substring(0, 20)}...`
                     : '-';
@@ -653,7 +710,7 @@
                     <td>${accountId}</td>
                     <td>${escapeHtml(account.email ?? '')}</td>
                     <td>${escapeHtml(localIdText)}</td>
-                    <td><span class="status-badge status-${statusValue}">${statusValue}</span></td>
+                    <td><span class="status-badge status-${statusValue}">${statusLabel}</span></td>
                     <td>${renderQuotaCell(account)}</td>
                     <td>${renderTokenExpiry(account.token_expires_at)}</td>
                     <td>${account.use_count || 0}</td>
@@ -1035,10 +1092,11 @@
             const ids = getSelectedIds();
             const bar = document.getElementById('batch-bar');
             const countEl = document.getElementById('selected-count');
-            bar.classList.add('visible');
             if (ids.length > 0) {
+                bar.classList.add('visible');
                 countEl.textContent = `已选 ${ids.length} 个`;
             } else {
+                bar.classList.remove('visible');
                 countEl.textContent = '未选择';
             }
         }
@@ -1049,7 +1107,7 @@
                 const badge = row.querySelector('.status-badge');
                 const cb = row.querySelector('.row-checkbox');
                 if (badge && cb) {
-                    cb.checked = badge.textContent.trim() === targetStatus;
+                    cb.checked = badge.classList.contains('status-' + targetStatus);
                 }
             });
             updateBatchBar();
@@ -1071,7 +1129,7 @@
                 const data = await resp.json();
                 if (data.success) {
                     document.getElementById('strategy-desc').textContent = `已切换: ${data.strategy}`;
-                    showError('策略已切换为: ' + data.strategy);
+                    showSuccess('策略已切换为: ' + data.strategy);
                 } else {
                     showError('切换失败: ' + (data.detail || '未知错误'));
                 }
@@ -1090,7 +1148,7 @@
                 const data = await resp.json();
                 if (data.success) {
                     const s = data.stats || {};
-                    alert(`${data.message}\n成功: ${s.refreshed || 0}\n失败: ${s.failed || 0}\n跳过: ${s.skipped || 0}`);
+                    showSuccess(`${data.message} — 成功: ${s.refreshed || 0}, 失败: ${s.failed || 0}, 跳过: ${s.skipped || 0}`);
                     loadSummary();
                     loadAccounts(currentPage);
                 } else {
@@ -1110,7 +1168,7 @@
                 const resp = await authFetch('/api/accounts/reset-usage', { method: 'POST' });
                 const data = await resp.json();
                 if (data.success) {
-                    alert(data.message);
+                    showSuccess(data.message);
                     loadSummary();
                     loadAccounts(currentPage);
                 } else {
@@ -1150,7 +1208,7 @@
                 });
                 const data = await resp.json();
                 if (data.success) {
-                    alert(data.message);
+                    showSuccess(data.message);
                     clearSelection();
                     loadAccounts(currentPage);
                     loadSummary();

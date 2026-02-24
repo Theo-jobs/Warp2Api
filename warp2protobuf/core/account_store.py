@@ -255,9 +255,9 @@ class AccountStore:
             return cursor.rowcount > 0
 
     def update_status(self, account_id: int, status: str) -> bool:
-        """更新单个账号状态（仅允许 available / disabled）"""
-        if status not in ("available", "disabled"):
-            raise ValueError(f"Invalid status: {status!r}, must be 'available' or 'disabled'")
+        """更新单个账号状态"""
+        if status not in ("available", "disabled", "exhausted"):
+            raise ValueError(f"Invalid status: {status!r}, must be 'available', 'disabled' or 'exhausted'")
 
         with sqlite3.connect(str(self.db_path)) as conn:
             cursor = conn.cursor()
@@ -271,8 +271,8 @@ class AccountStore:
 
     def batch_update_status(self, account_ids: list[int], status: str) -> int:
         """批量更新账号状态，返回实际更新数量"""
-        if status not in ("available", "disabled"):
-            raise ValueError(f"Invalid status: {status!r}, must be 'available' or 'disabled'")
+        if status not in ("available", "disabled", "exhausted"):
+            raise ValueError(f"Invalid status: {status!r}, must be 'available', 'disabled' or 'exhausted'")
 
         if not account_ids:
             return 0

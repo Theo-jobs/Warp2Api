@@ -82,19 +82,10 @@ else
     warn "请手动在极空间创建 ${COMPOSE_DIR}/.env 文件"
 fi
 
-# ========== Step 3: 停止旧容器 ==========
-log "Step 3/7: 停止旧容器..."
-run_sudo "cd ${COMPOSE_DIR} && docker compose down --remove-orphans 2>/dev/null; docker stop ${CONTAINER_NAME} 2>/dev/null; docker rm -f ${CONTAINER_NAME} 2>/dev/null; echo done" || true
-log "旧容器已清除"
-
-# ========== Step 4: 删除旧镜像 ==========
-log "Step 4/7: 删除旧镜像..."
-run_sudo "docker rmi -f ${IMAGE_NAME}:latest 2>/dev/null; docker image prune -f 2>/dev/null; echo done" || true
-log "旧镜像已清理"
-
-# ========== Step 5: 生成并上传 docker-compose.yml ==========
-log "Step 5/7: 生成 docker-compose.yml..."
+# ========== Step 3: 生成并上传 docker-compose.yml ==========
+log "Step 3/7: 生成 docker-compose.yml..."
 TMPFILE=$(mktemp)
+trap 'rm -f "$TMPFILE"' EXIT
 cat > "$TMPFILE" <<DEOF
 services:
   warp2api:
@@ -133,17 +124,26 @@ run_sudo "mv /tmp/docker-compose.yml ${COMPOSE_DIR}/docker-compose.yml"
 rm -f "$TMPFILE"
 log "docker-compose.yml 已就位"
 
-# ========== Step 6: 构建并启动 ==========
-log "Step 6/7: docker compose build（首次可能需要 5-10 分钟）..."
-run_sudo "cd ${COMPOSE_DIR} && docker compose build --no-cache 2>&1"
+# ========== Step 4: 先构建新镜像（旧容器继续服务） ==========
+log "Step 4/7: docker compose build（旧容器继续运行，构建新镜像）..."
+run_sudo "cd ${COMPOSE_DIR} && docker compose build 2>&1"
 BUILD_EXIT=$?
 VERIFY=$(run_sudo "docker images | grep ${IMAGE_NAME}" || echo "")
 if [ $BUILD_EXIT -ne 0 ] || ! echo "$VERIFY" | grep -q "${IMAGE_NAME}"; then
-    err "镜像构建失败"
+    err "镜像构建失败（旧容器未受影响，服务仍在运行）"
 fi
-log "镜像构建成功，启动容器..."
+log "新镜像构建成功"
+
+# ========== Step 5: 停止旧容器，启动新容器 ==========
+log "Step 5/7: 切换容器（停旧启新）..."
+run_sudo "cd ${COMPOSE_DIR} && docker compose down --remove-orphans 2>/dev/null; echo done" || true
 run_sudo "cd ${COMPOSE_DIR} && docker compose up -d" || err "容器启动失败"
-log "容器已启动"
+log "新容器已启动"
+
+# ========== Step 6: 清理旧镜像 ==========
+log "Step 6/7: 清理悬空镜像..."
+run_sudo "docker image prune -f 2>/dev/null; echo done" || true
+log "旧镜像已清理"
 
 # ========== Step 7: 健康检查 ==========
 log "Step 7/7: 等待健康检查..."

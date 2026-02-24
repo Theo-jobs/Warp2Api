@@ -22,7 +22,7 @@ from .config import BRIDGE_BASE_URL, WARMUP_INIT_RETRIES, WARMUP_INIT_DELAY_S
 from .bridge import initialize_once
 from .router import router
 from .anthropic_router import anthropic_router, build_streaming_response_for_account
-from .token_manager import TokenManager
+from .token_manager import TokenManager, _extract_exp_from_jwt
 from .auth import verify_admin_token, authenticate_request
 from .anthropic_models import AnthropicMessagesRequest
 
@@ -413,7 +413,7 @@ def _is_transient_error(err: Exception) -> bool:
 def _save_refreshed_token(account_id: int, new_token: str) -> None:
     """将刷新后的 token 写回数据库，更新 token_expires_at。"""
     try:
-        expires_at = time.time() + 3600  # Firebase id_token 60 分钟有效
+        expires_at = _extract_exp_from_jwt(new_token) or (time.time() + 3600)
         with sqlite3.connect(ACCOUNT_DB_PATH) as conn:
             conn.execute(
                 "UPDATE accounts SET id_token = ?, token_expires_at = ?, updated_at = ? WHERE id = ?",
@@ -681,6 +681,9 @@ async def force_refresh_single(account_id: int) -> dict[str, Any]:
         error_msg = str(e)[:200]
         logger.error("[ForceRefresh] 单账号刷新失败: %s — %s", email, error_msg)
         return {"success": False, "detail": f"{email}: {error_msg}"}
+
+
+class RegisterRequest(BaseModel):
     count: int = 5
     delay_s: float = 5.0
     default_quota: int = 300
@@ -862,6 +865,9 @@ async def force_token_refresh() -> dict[str, Any]:
         "was_firebase_blocked": was_blocked,
         "stats": stats,
     }
+
+
+@app.get("/api/system/stats", dependencies=[Depends(verify_admin_token)])
 async def get_system_stats() -> dict[str, Any]:
     """获取系统监控信息"""
     try:

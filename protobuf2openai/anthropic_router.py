@@ -7,9 +7,11 @@ Warp packet format, and streams back Anthropic-format SSE responses.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import re
 import sqlite3
 import time
 import uuid
@@ -36,6 +38,64 @@ from .helpers import normalize_content_to_list, segments_to_text
 from .models import ChatMessage
 from .packets import attach_user_and_tools_to_inputs, packet_template
 from .token_manager import TokenManager
+
+# ---- 全局 bridge 请求并发控制 ----
+# 限制同时打到 Warp bridge 的请求数，防止多 agent 并发导致 429 雪崩
+_BRIDGE_SEMAPHORE = asyncio.Semaphore(2)
+# 全局 bridge 429 冷却（秒）
+_bridge_429_until: float = 0.0
+_BRIDGE_429_COOLDOWN = 30  # bridge 429 后冷却 30 秒
+_BRIDGE_MAX_WAIT = 90  # 排队最大等待时间（秒），超时才返回 429
+
+
+def _is_bridge_throttled() -> bool:
+    return time.time() < _bridge_429_until
+
+
+def _set_bridge_throttled() -> None:
+    global _bridge_429_until
+    _bridge_429_until = time.time() + _BRIDGE_429_COOLDOWN
+    logging.getLogger(__name__).warning(
+        "[Anthropic] Bridge 429 全局冷却已触发，%ds 内新请求排队等待", _BRIDGE_429_COOLDOWN
+    )
+
+
+async def _wait_for_bridge_ready() -> bool:
+    """等待 bridge 冷却结束。返回 True 表示就绪，False 表示超时。"""
+    if not _is_bridge_throttled():
+        return True
+    wait_until = time.time() + _BRIDGE_MAX_WAIT
+    remaining = _bridge_429_until - time.time()
+    logging.getLogger(__name__).info(
+        "[Anthropic] 请求排队等待 bridge 冷却，预计 %.0fs", remaining
+    )
+    while _is_bridge_throttled():
+        if time.time() > wait_until:
+            return False
+        await asyncio.sleep(2)  # 每 2 秒检查一次
+    return True
+
+
+# SSE chunk 中提取 token 统计的正则
+_RE_INPUT_TOKENS = re.compile(r'"input_tokens"\s*:\s*(\d+)')
+_RE_OUTPUT_TOKENS = re.compile(r'"output_tokens"\s*:\s*(\d+)')
+
+
+def _extract_usage_from_chunk(
+    chunk: str, cur_input: int, cur_output: int
+) -> tuple[int, int]:
+    """从 SSE chunk 文本中提取 input_tokens / output_tokens，返回更新后的累计值。"""
+    # message_start 事件包含 input_tokens
+    if "message_start" in chunk:
+        m = _RE_INPUT_TOKENS.search(chunk)
+        if m:
+            cur_input = max(cur_input, int(m.group(1)))
+    # message_delta 事件包含 output_tokens
+    if "message_delta" in chunk:
+        m = _RE_OUTPUT_TOKENS.search(chunk)
+        if m:
+            cur_output = max(cur_output, int(m.group(1)))
+    return cur_input, cur_output
 
 
 def _get_account_by_id_with_tokens(db_path: str, account_id: int) -> dict[str, Any] | None:
@@ -390,11 +450,16 @@ def _resolve_thinking_model(model: str, thinking_enabled: bool) -> str:
 def _anthropic_nonstream_response_from_bridge(
     bridge_resp: dict[str, Any],
     model: str,
-) -> dict[str, Any]:
-    """Build Anthropic non-stream response from /api/warp/send_stream result."""
+) -> tuple[dict[str, Any], bool]:
+    """Build Anthropic non-stream response from /api/warp/send_stream result.
+
+    Returns:
+        (response_dict, hit_quota_limit) — hit_quota_limit 为 True 表示服务端返回额度耗尽。
+    """
     text_parts: list[str] = []
     tool_blocks: list[dict[str, Any]] = []
     stop_reason: str = "end_turn"
+    _hit_quota_limit = False
 
     usage = AnthropicUsage()
 
@@ -467,6 +532,7 @@ def _anthropic_nonstream_response_from_bridge(
                         stop_reason = "max_tokens"
                     elif "quota_limit" in reason or "quotaLimit" in reason:
                         stop_reason = "end_turn"
+                        _hit_quota_limit = True
                     elif "llm_unavailable" in reason or "llmUnavailable" in reason:
                         stop_reason = "end_turn"
                     elif "internal_error" in reason or "internalError" in reason:
@@ -500,7 +566,7 @@ def _anthropic_nonstream_response_from_bridge(
         "stop_reason": stop_reason,
         "stop_sequence": None,
         "usage": usage.model_dump(),
-    }
+    }, _hit_quota_limit
 
 
 # ---------------------------------------------------------------------------
@@ -521,6 +587,16 @@ async def anthropic_messages(request: Request) -> Any:
         raise HTTPException(status_code=400, detail=f"Invalid request: {e}")
 
     # --- Token acquisition (mirrors router.py pattern) ---
+    # bridge 冷却中则排队等待（最多 90 秒），超时才返回 429
+    if _is_bridge_throttled():
+        ready = await _wait_for_bridge_ready()
+        if not ready:
+            raise HTTPException(
+                status_code=429,
+                detail="Rate limited, all retries exhausted",
+                headers={"Retry-After": "30"},
+            )
+
     selector = AccountSelector(ACCOUNT_DB_PATH)
     token_mgr = TokenManager.get_instance(ACCOUNT_DB_PATH)
 
@@ -665,63 +741,83 @@ async def anthropic_messages(request: Request) -> Any:
     )
 
     if req.stream:
-        # --- Stream response (with record_usage + 429 retry) ---
+        # --- Stream response (with semaphore + token tracking) ---
         _stream_access_token = access_token
         _stream_account_id = account_id
 
         async def _stream_with_usage():
             nonlocal _stream_access_token, _stream_account_id
-            _chunk_idx = 0
-            _got_429 = False
-            _buffered: list[str] = []
-            try:
-                async for chunk in stream_anthropic_sse(packet, model=req.model, access_token=_stream_access_token):
-                    # bridge 429 在前几个 chunk 内出现（message_start → text_block → text_delta 含错误文本）
-                    if _chunk_idx < 6:
-                        _buffered.append(chunk)
-                        if "Bridge error: HTTP 429" in chunk:
-                            _got_429 = True
-                            break
-                        _chunk_idx += 1
-                        continue
-                    # 前几个 chunk 无 429，flush buffer 并正常流式输出
-                    if _buffered:
+            _input_tokens = 0
+            _output_tokens = 0
+            _hit_quota = False
+
+            # 全局并发控制：最多 2 个请求同时打到 bridge
+            async with _BRIDGE_SEMAPHORE:
+                _chunk_idx = 0
+                _got_429 = False
+                _buffered: list[str] = []
+                try:
+                    async for chunk in stream_anthropic_sse(packet, model=req.model, access_token=_stream_access_token):
+                        # 内部元数据信号（不是 SSE 事件），不 yield 给客户端
+                        if chunk.startswith("\x00"):
+                            if "__QUOTA_LIMIT__" in chunk:
+                                _hit_quota = True
+                            continue
+                        # 检测前几个 chunk 是否有 429
+                        if _chunk_idx < 6:
+                            _buffered.append(chunk)
+                            if "Bridge error: HTTP 429" in chunk:
+                                _got_429 = True
+                                break
+                            _chunk_idx += 1
+                            continue
+                        # flush buffer
+                        if _buffered:
+                            for buf in _buffered:
+                                # 解析 token 统计
+                                _input_tokens, _output_tokens = _extract_usage_from_chunk(
+                                    buf, _input_tokens, _output_tokens
+                                )
+                                yield buf
+                            _buffered.clear()
+                        # 解析 token 统计
+                        _input_tokens, _output_tokens = _extract_usage_from_chunk(
+                            chunk, _input_tokens, _output_tokens
+                        )
+                        yield chunk
+
+                    if not _got_429:
+                        # flush 残余 buffer
                         for buf in _buffered:
+                            _input_tokens, _output_tokens = _extract_usage_from_chunk(
+                                buf, _input_tokens, _output_tokens
+                            )
                             yield buf
-                        _buffered.clear()
-                    yield chunk
-
-                if not _got_429:
-                    # flush 残余 buffer（短响应可能不超过 6 个 chunk）
-                    for buf in _buffered:
-                        yield buf
-                    selector.record_usage(_stream_account_id, 1)
-                    return
-
-                # 429 换号重试
-                logger.warning("[Anthropic] stream 429 on account_id=%d, retrying", _stream_account_id)
-                token_mgr.mark_account_failed(_stream_account_id)
-                retry_account = selector.select_account(exclude_ids=_tried_ids)
-                if retry_account:
-                    retry_token = await token_mgr.get_valid_token(retry_account)
-                    if retry_token:
-                        _tried_ids.add(retry_account["id"])
-                        _stream_access_token = retry_token
-                        _stream_account_id = retry_account["id"]
-                        async with token_mgr.env_lock:
-                            os.environ["WARP_JWT"] = retry_token
-                        async for chunk in stream_anthropic_sse(packet, model=req.model, access_token=retry_token):
-                            yield chunk
-                        selector.record_usage(_stream_account_id, 1)
+                        # 用真实 token 数记录使用
+                        total_tokens = _input_tokens + _output_tokens
+                        selector.record_usage(_stream_account_id, max(1, total_tokens))
+                        logger.info(
+                            "[Anthropic] stream done: account_id=%d input=%d output=%d total=%d",
+                            _stream_account_id, _input_tokens, _output_tokens, total_tokens,
+                        )
+                        # 额度耗尽 → 标记 exhausted
+                        if _hit_quota:
+                            logger.warning("[Anthropic] stream quota_limit hit on account_id=%d, marking exhausted", _stream_account_id)
+                            token_mgr.mark_account_exhausted(_stream_account_id)
                         return
 
-                # 换号失败，原样输出 429 错误
-                logger.error("[Anthropic] stream 429 retry failed, no more accounts")
-                yield 'event: error\ndata: {"type":"error","error":{"type":"rate_limit_error","message":"All accounts rate-limited"}}\n\n'
+                    # 429 → 触发全局冷却，直接返回错误给 CC（不内部重试）
+                    _set_bridge_throttled()
+                    token_mgr.mark_account_failed(_stream_account_id)
+                    logger.warning(
+                        "[Anthropic] stream 429 on account_id=%d, returning to client (no internal retry)",
+                        _stream_account_id,
+                    )
+                    yield 'event: error\ndata: {"type":"error","error":{"type":"rate_limit_error","message":"Rate limited, please retry after 30s"}}\n\n'
 
-            except Exception as exc:
-                logger.error("[Anthropic] stream error: %s", exc)
-                raise
+                except Exception as exc:
+                    logger.error("[Anthropic] stream error: %s", exc)
+                    raise
 
         return StreamingResponse(
             _stream_with_usage(),
@@ -750,24 +846,25 @@ async def anthropic_messages(request: Request) -> Any:
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"bridge_unreachable: {exc}") from exc
 
-    # --- 429 限流换号重试 ---
+    # --- 429 限流：触发冷却，排队等待后重试一次 ---
     if resp.status_code == 429:
-        logger.warning("[Anthropic] 429 rate-limited on account_id=%d, attempting retry", account_id)
+        _set_bridge_throttled()
         token_mgr.mark_account_failed(account_id)
-        retry_account = selector.select_account(exclude_ids=_tried_ids)
-        if retry_account:
-            retry_token = await token_mgr.get_valid_token(retry_account)
-            if retry_token:
-                _tried_ids.add(retry_account["id"])
-                req_body["access_token"] = retry_token
-                async with token_mgr.env_lock:
-                    os.environ["WARP_JWT"] = retry_token
-                try:
-                    resp = requests.post(bridge_url, json=req_body, timeout=(5.0, 180.0))
-                    logger.info("[Anthropic] 429 retry succeeded with account_id=%d", retry_account["id"])
-                    account_id = retry_account["id"]
-                except Exception as exc:
-                    raise HTTPException(status_code=502, detail=f"bridge_unreachable on retry: {exc}") from exc
+        logger.warning("[Anthropic] non-stream 429 on account_id=%d, waiting for cooldown", account_id)
+        ready = await _wait_for_bridge_ready()
+        if ready:
+            # 冷却结束，重试一次
+            try:
+                resp = requests.post(bridge_url, json=req_body, timeout=(5.0, 180.0))
+                logger.info("[Anthropic] non-stream 429 retry result: %d", resp.status_code)
+            except Exception as exc:
+                raise HTTPException(status_code=502, detail=f"bridge_unreachable on retry: {exc}") from exc
+        if resp.status_code == 429:
+            raise HTTPException(
+                status_code=429,
+                detail="Rate limited, all retries exhausted",
+                headers={"Retry-After": "30"},
+            )
 
     if resp.status_code != 200:
         detail = resp.text[:300]
@@ -778,9 +875,22 @@ async def anthropic_messages(request: Request) -> Any:
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Invalid bridge response: {exc}") from exc
 
-    selector.record_usage(account_id, 1)
+    final_payload, hit_quota_limit = _anthropic_nonstream_response_from_bridge(bridge_resp, req.model)
 
-    final_payload = _anthropic_nonstream_response_from_bridge(bridge_resp, req.model)
+    # 额度耗尽 → 标记 exhausted
+    if hit_quota_limit:
+        logger.warning("[Anthropic] non-stream quota_limit hit on account_id=%d, marking exhausted", account_id)
+        token_mgr.mark_account_exhausted(account_id)
+
+    # 从非流式响应中提取真实 token 统计
+    usage = final_payload.get("usage", {})
+    total_tokens = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+    selector.record_usage(account_id, max(1, total_tokens))
+    logger.info(
+        "[Anthropic] non-stream done: account_id=%d input=%d output=%d total=%d",
+        account_id, usage.get("input_tokens", 0), usage.get("output_tokens", 0), total_tokens,
+    )
+
     return JSONResponse(content=final_payload)
 
 

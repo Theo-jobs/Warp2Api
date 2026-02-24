@@ -272,9 +272,22 @@ class TokenManager:
                 account_id, total, used, remaining,
             )
 
-            # 额度耗尽则自动标记 exhausted
+            # 额度耗尽则自动标记 exhausted；有额度则恢复 available（从 exhausted/token_expired）
             if remaining <= 0:
                 self.mark_account_exhausted(account_id)
+            else:
+                # 查询成功说明 token 有效，如果之前是 token_expired/exhausted 则恢复
+                with sqlite3.connect(str(self.db_path)) as conn:
+                    row = conn.execute(
+                        "SELECT status FROM accounts WHERE id = ?", (account_id,)
+                    ).fetchone()
+                    if row and row[0] in ("exhausted", "token_expired"):
+                        conn.execute(
+                            "UPDATE accounts SET status = 'available', updated_at = ? WHERE id = ?",
+                            (datetime.now().isoformat(), account_id),
+                        )
+                        conn.commit()
+                        logger.info("[TokenManager] account_id=%d 状态恢复: %s → available", account_id, row[0])
 
         except Exception as exc:
             # 额度查询失败不影响主流程，仅记录日志
@@ -513,6 +526,27 @@ class TokenManager:
         if refreshed > 0:
             logger.info("[TokenManager] 预刷新完成，本轮刷新 %d 个", refreshed)
 
+        # ── 僵尸账号清扫：available 但 token 已过期的，标记为 token_expired ──
+        # 这样 _check_exhausted_accounts 会自动接管刷新+恢复
+        try:
+            with sqlite3.connect(str(self.db_path)) as conn:
+                stale_count = conn.execute(
+                    """UPDATE accounts SET status = 'token_expired', updated_at = ?
+                       WHERE status = 'available'
+                         AND token_expires_at > 0
+                         AND token_expires_at < ?
+                         AND refresh_token IS NOT NULL AND refresh_token != ''""",
+                    (datetime.now().isoformat(), now),
+                ).rowcount
+                conn.commit()
+                if stale_count > 0:
+                    logger.info(
+                        "[TokenManager] 标记 %d 个僵尸账号为 token_expired（available 但 token 已过期）",
+                        stale_count,
+                    )
+        except Exception as exc:
+            logger.debug("[TokenManager] 僵尸账号清扫异常: %s", exc)
+
         return self._calc_next_check_interval()
 
     def _calc_next_check_interval(self) -> int:
@@ -557,7 +591,7 @@ class TokenManager:
             rows = conn.execute(
                 """SELECT id, email, refresh_token, updated_at
                    FROM accounts
-                   WHERE status = 'exhausted'
+                   WHERE status IN ('exhausted', 'token_expired')
                      AND refresh_token IS NOT NULL AND refresh_token != ''
                      AND (updated_at IS NULL OR updated_at < ?)
                    ORDER BY updated_at ASC

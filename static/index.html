@@ -87,6 +87,7 @@
         .status-available { background: #d4edda; color: #155724; }
         .status-disabled { background: #f8d7da; color: #721c24; }
         .status-exhausted { background: #fff3cd; color: #856404; }
+        .status-token-expired { background: #e2e3e5; color: #383d41; }
 
         th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
         th.sortable:hover { background: #e9ecef; }
@@ -319,6 +320,7 @@
                 <option value="available">可用</option>
                 <option value="disabled">已禁用</option>
                 <option value="exhausted">额度耗尽</option>
+                <option value="token_expired">Token过期</option>
             </select>
             <button onclick="loadAccounts()">🔍 搜索</button>
             <button onclick="loadSummary()">🔄 刷新</button>
@@ -615,7 +617,23 @@
         function normalizeStatus(status) {
             if (status === 'disabled') return 'disabled';
             if (status === 'exhausted') return 'exhausted';
+            if (status === 'token_expired') return 'token_expired';
             return 'available';
+        }
+
+        // 状态中文映射
+        function statusToChinese(statusValue, tokenExpired) {
+            if (statusValue === 'token_expired') return 'Token过期';
+            if (tokenExpired) return 'Token过期';
+            if (statusValue === 'disabled') return '已禁用';
+            if (statusValue === 'exhausted') return '额度耗尽';
+            return '可用';
+        }
+
+        // 判断 token 是否已过期
+        function isTokenExpired(expiresAt) {
+            if (!expiresAt || expiresAt <= 0) return false;
+            return expiresAt < Date.now() / 1000;
         }
 
         function renderRecentAccounts(accounts) {
@@ -624,7 +642,7 @@
 
             const lines = accounts.slice(0, 5).map(account => {
                 const statusValue = normalizeStatus(account.status);
-                const statusText = statusValue === 'disabled' ? '已禁用' : '可用';
+                const statusText = statusToChinese(statusValue, false);
                 const email = escapeHtml(account.email ?? '-');
                 const remaining = Number(account.remaining_limit) || 0;
                 const usedCount = Number(account.use_count) || 0;
@@ -696,12 +714,16 @@
                 const tr = document.createElement('tr');
                 tr.id = `account-row-${accountId}`;
                 const statusValue = normalizeStatus(account.status);
+                const tokenExpired = isTokenExpired(account.token_expires_at);
                 const isDisabled = statusValue === 'disabled';
                 const isExhausted = statusValue === 'exhausted';
-                const toggleBtnClass = (isDisabled || isExhausted) ? 'btn-enable' : 'btn-disable';
-                const toggleBtnText = (isDisabled || isExhausted) ? '启用' : '禁用';
-                const toggleTarget = (isDisabled || isExhausted) ? 'available' : 'disabled';
-                const statusLabel = isExhausted ? '额度耗尽' : statusValue;
+                const isTokenExp = statusValue === 'token_expired';
+                const isInactive = isDisabled || isExhausted || isTokenExp;
+                const toggleBtnClass = isInactive ? 'btn-enable' : 'btn-disable';
+                const toggleBtnText = isInactive ? '启用' : '禁用';
+                const toggleTarget = isInactive ? 'available' : 'disabled';
+                const statusLabel = statusToChinese(statusValue, tokenExpired);
+                const statusCssClass = (statusValue === 'token_expired' || tokenExpired) ? 'token-expired' : statusValue;
                 const localIdText = typeof account.local_id === 'string' && account.local_id
                     ? `${account.local_id.substring(0, 20)}...`
                     : '-';
@@ -710,7 +732,7 @@
                     <td>${accountId}</td>
                     <td>${escapeHtml(account.email ?? '')}</td>
                     <td>${escapeHtml(localIdText)}</td>
-                    <td><span class="status-badge status-${statusValue}">${statusLabel}</span></td>
+                    <td><span class="status-badge status-${statusCssClass}">${statusLabel}</span></td>
                     <td>${renderQuotaCell(account)}</td>
                     <td>${renderTokenExpiry(account.token_expires_at)}</td>
                     <td>${account.use_count || 0}</td>

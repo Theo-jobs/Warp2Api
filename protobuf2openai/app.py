@@ -527,10 +527,10 @@ async def batch_verify_quota() -> dict[str, Any]:
             remaining = quota_info.get("remaining", total_limit - used_limit)
 
             store.update_limit(account_id, total_limit, used_limit)
-            # 额度归零 → 标记 exhausted；额度恢复 → 重新启用
+            # 额度归零 → 标记 exhausted；有额度 → 恢复 available（无论之前是 exhausted/token_expired）
             if remaining <= 0:
                 store.update_status(account_id, "exhausted")
-            elif account.get("status") == "exhausted" and remaining > 0:
+            elif account.get("status") in ("exhausted", "token_expired") and remaining > 0:
                 store.update_status(account_id, "available")
             # 如果触发了 token 刷新，写回数据库
             if new_token:
@@ -547,7 +547,7 @@ async def batch_verify_quota() -> dict[str, Any]:
             error_msg = str(e)[:200]
             results["invalid"] += 1
             if _is_auth_error(e):
-                store.update_status(account_id, "disabled")
+                store.update_status(account_id, "token_expired")
             elif _is_transient_error(e):
                 logger.warning("[VerifyQuota] transient error account_id=%s: %s", account_id, error_msg)
             # 检测 429 → 触发全局限流并中断批量操作
@@ -615,11 +615,11 @@ async def verify_single_quota(account_id: int) -> dict[str, Any]:
         remaining = quota_info.get("remaining", total_limit - used_limit)
 
         store.update_limit(account_id, total_limit, used_limit)
-        # 额度归零 → 标记 exhausted；额度恢复 → 重新启用
+        # 额度归零 → 标记 exhausted；有额度 → 恢复 available（无论之前是 exhausted/token_expired）
         current_status = row["status"] if "status" in row.keys() else None
         if remaining <= 0:
             store.update_status(account_id, "exhausted")
-        elif current_status == "exhausted" and remaining > 0:
+        elif current_status in ("exhausted", "token_expired") and remaining > 0:
             store.update_status(account_id, "available")
         if new_token:
             _save_refreshed_token(account_id, new_token)
@@ -637,7 +637,7 @@ async def verify_single_quota(account_id: int) -> dict[str, Any]:
     except Exception as e:
         error_msg = str(e)[:200]
         if _is_auth_error(e):
-            store.update_status(account_id, "disabled")
+            store.update_status(account_id, "token_expired")
         elif _is_transient_error(e):
             logger.warning("[VerifyQuota] transient error account_id=%s: %s", account_id, error_msg)
         return {

@@ -569,6 +569,38 @@ def _anthropic_nonstream_response_from_bridge(
     }, _hit_quota_limit
 
 
+async def _auto_sync_quota_on_empty(token_mgr: "TokenManager") -> None:
+    """无可用账号时自动触发额度同步（最多 3 个 used_limit 最高的 available 账号）。
+
+    目的：本地 used_limit 可能虚高，同步真实额度后可能恢复可用。
+    """
+    try:
+        with sqlite3.connect(str(token_mgr.db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """SELECT id, email, id_token, refresh_token
+                   FROM accounts
+                   WHERE status = 'available'
+                     AND refresh_token IS NOT NULL AND refresh_token != ''
+                   ORDER BY used_limit DESC
+                   LIMIT 3"""
+            ).fetchall()
+        if not rows:
+            return
+        for row in rows:
+            try:
+                token = row["id_token"]
+                if not token or token == "":
+                    token = await token_mgr._do_refresh(row["refresh_token"])
+                if token:
+                    await token_mgr.sync_account_quota(row["id"], token)
+            except Exception as e:
+                logger.debug("[AutoSync] account_id=%d failed: %s", row["id"], e)
+        logger.info("[AutoSync] Triggered quota sync for %d accounts on 503", len(rows))
+    except Exception as e:
+        logger.warning("[AutoSync] Failed: %s", e)
+
+
 # ---------------------------------------------------------------------------
 # Main endpoint
 # ---------------------------------------------------------------------------
@@ -602,6 +634,9 @@ async def anthropic_messages(request: Request) -> Any:
 
     account = selector.select_account()
     if not account:
+        # 无可用账号 → 自动触发一次快速额度同步（fire-and-forget），可能是本地计数虚高
+        if not token_mgr.is_firebase_blocked():
+            asyncio.create_task(_auto_sync_quota_on_empty(token_mgr))
         if token_mgr.is_firebase_blocked():
             remaining = int((TokenManager._firebase_blocked_until - time.time()) / 60)
             raise HTTPException(
@@ -796,6 +831,8 @@ async def anthropic_messages(request: Request) -> Any:
                         # 用真实 token 数记录使用
                         total_tokens = _input_tokens + _output_tokens
                         selector.record_usage(_stream_account_id, 1)
+                        # fire-and-forget: 同步真实额度（不同模型消耗不同 credits）
+                        asyncio.create_task(token_mgr.sync_account_quota(_stream_account_id, _stream_access_token))
                         logger.info(
                             "[Anthropic] stream done: account_id=%d input=%d output=%d total=%d",
                             _stream_account_id, _input_tokens, _output_tokens, total_tokens,
@@ -886,6 +923,8 @@ async def anthropic_messages(request: Request) -> Any:
     usage = final_payload.get("usage", {})
     total_tokens = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
     selector.record_usage(account_id, 1)
+    # fire-and-forget: 同步真实额度（不同模型消耗不同 credits）
+    asyncio.create_task(token_mgr.sync_account_quota(account_id, access_token))
     logger.info(
         "[Anthropic] non-stream done: account_id=%d input=%d output=%d total=%d",
         account_id, usage.get("input_tokens", 0), usage.get("output_tokens", 0), total_tokens,

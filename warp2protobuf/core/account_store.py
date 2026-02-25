@@ -170,7 +170,7 @@ class AccountStore:
                     (total_limit - used_limit) as remaining_limit,
                     last_check, use_count, last_used,
                     created_at, updated_at,
-                    token_expires_at
+                    token_expires_at, api_key
                 FROM accounts
                 {where_sql}
                 ORDER BY created_at DESC
@@ -193,7 +193,7 @@ class AccountStore:
                     (total_limit - used_limit) as remaining_limit,
                     last_check, use_count, last_used,
                     created_at, updated_at,
-                    token_expires_at
+                    token_expires_at, api_key
                 FROM accounts
                 WHERE id = ?
             """, (account_id,))

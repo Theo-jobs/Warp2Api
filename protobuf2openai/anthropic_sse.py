@@ -206,14 +206,14 @@ def _ingest_finished_usage(finished: dict[str, Any], state: AnthropicSseState) -
         output = usage0.get("output")
 
         try:
-            if isinstance(total_input, (int, float)):
-                state.input_tokens = max(0, int(total_input))
+            if isinstance(total_input, (int, float)) and int(total_input) > 0:
+                state.input_tokens = max(state.input_tokens, int(total_input))
         except Exception:
             pass
 
         try:
-            if isinstance(output, (int, float)):
-                state.output_tokens = max(0, int(output))
+            if isinstance(output, (int, float)) and int(output) > 0:
+                state.output_tokens = max(state.output_tokens, int(output))
         except Exception:
             pass
 
@@ -340,6 +340,7 @@ async def stream_anthropic_sse(
     *,
     model: str = "claude-sonnet-4-20250514",
     access_token: str | None = None,
+    estimated_input_tokens: int = 0,
 ) -> AsyncGenerator[str, None]:
     """
     向 Warp bridge 发送请求，将 protobuf SSE 流转换为 Anthropic Messages SSE 格式。
@@ -347,6 +348,7 @@ async def stream_anthropic_sse(
     参照 sse_transform.py 中 stream_openai_sse() 的 bridge 请求模式。
     """
     state = AnthropicSseState(model=model)
+    state.input_tokens = estimated_input_tokens
 
     # ---- 构造 bridge 请求（与 stream_openai_sse 完全一致：JSON body） ----
     bridge_url = f"{BRIDGE_BASE_URL}/api/warp/send_stream_sse"

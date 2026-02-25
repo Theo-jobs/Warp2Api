@@ -38,6 +38,7 @@ from .helpers import normalize_content_to_list, segments_to_text
 from .models import ChatMessage
 from .packets import attach_user_and_tools_to_inputs, packet_template
 from .token_manager import TokenManager
+from .utils import serialize_history_to_text
 
 # ---- 全局 bridge 请求并发控制 ----
 # 限制同时打到 Warp bridge 的请求数，防止多 agent 并发导致 429 雪崩
@@ -83,6 +84,29 @@ async def _wait_for_bridge_ready() -> bool:
 # SSE chunk 中提取 token 统计的正则
 _RE_INPUT_TOKENS = re.compile(r'"input_tokens"\s*:\s*(\d+)')
 _RE_OUTPUT_TOKENS = re.compile(r'"output_tokens"\s*:\s*(\d+)')
+
+
+def _estimate_input_tokens(req: "AnthropicMessagesRequest") -> int:
+    """从请求体估算 input tokens（Warp 不返回真实值，4 字符 ≈ 1 token）。"""
+    total_chars = 0
+    # system prompt
+    if req.system:
+        if isinstance(req.system, str):
+            total_chars += len(req.system)
+        elif isinstance(req.system, list):
+            for block in req.system:
+                if isinstance(block, dict):
+                    total_chars += len(block.get("text", ""))
+    # messages
+    for msg in req.messages:
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            total_chars += len(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    total_chars += len(block.get("text", ""))
+    return max(1, total_chars // 4)
 
 
 def _extract_usage_from_chunk(
@@ -364,55 +388,6 @@ def _convert_tools_to_openai(anthropic_tools: list[dict[str, Any]] | None) -> li
             },
         })
     return openai_tools
-
-
-def _serialize_history_to_text(history: list[ChatMessage]) -> str | None:
-    """将多轮对话历史序列化为文本，注入 system prompt（无状态模式）。
-
-    跳过 system 消息和尾部当前输入（与 attach_user_and_tools_to_inputs 对齐）。
-    """
-    non_system = [m for m in history if m.role != "system"]
-    if len(non_system) <= 1:
-        return None
-
-    if non_system[-1].role == "tool":
-        split_idx = len(non_system)
-        while split_idx > 0 and non_system[split_idx - 1].role == "tool":
-            split_idx -= 1
-        history_msgs = non_system[:split_idx]
-    else:
-        history_msgs = non_system[:-1]
-
-    if not history_msgs:
-        return None
-
-    lines: list[str] = []
-    for m in history_msgs:
-        text = segments_to_text(normalize_content_to_list(m.content))
-        if m.role == "user":
-            lines.append(f"User: {text}")
-        elif m.role == "assistant":
-            if text:
-                lines.append(f"Assistant: {text}")
-            for tc in (m.tool_calls or []):
-                fn = tc.get("function") or {}
-                tc_name = fn.get("name", "unknown")
-                tc_args = fn.get("arguments", "{}")
-                lines.append(f"Assistant: [called tool: {tc_name}({tc_args})]")
-        elif m.role == "tool":
-            max_chars = max(1, HISTORY_TOOL_RESULT_MAX_CHARS)
-            lines.append(
-                f"Tool result ({m.tool_call_id or 'unknown'}): {text[:max_chars]}"
-            )
-
-    if not lines:
-        return None
-    return (
-        "[Previous conversation]\n"
-        + "\n".join(lines)
-        + "\n[End of previous conversation]\n\n"
-        + "Continue the conversation naturally based on the above context."
-    )
 
 
 def _resolve_thinking_model(model: str, thinking_enabled: bool) -> str:
@@ -779,7 +754,7 @@ async def anthropic_messages(request: Request) -> Any:
         ))
 
     # --- Serialize history to text for stateless mode (multi-turn support) ---
-    history_text = _serialize_history_to_text(chat_messages)
+    history_text = serialize_history_to_text(chat_messages, max_tool_chars=HISTORY_TOOL_RESULT_MAX_CHARS)
     if history_text:
         if final_system:
             final_system = final_system + "\n\n" + history_text
@@ -811,6 +786,9 @@ async def anthropic_messages(request: Request) -> Any:
     )
 
     if req.stream:
+        # --- 估算 input tokens（Warp 不返回真实值，用字符数 / 4 近似）---
+        _est_input = _estimate_input_tokens(req)
+
         # --- Stream response (with semaphore + token tracking) ---
         _stream_access_token = access_token
         _stream_account_id = account_id
@@ -827,7 +805,7 @@ async def anthropic_messages(request: Request) -> Any:
                 _got_429 = False
                 _buffered: list[str] = []
                 try:
-                    async for chunk in stream_anthropic_sse(packet, model=req.model, access_token=_stream_access_token):
+                    async for chunk in stream_anthropic_sse(packet, model=req.model, access_token=_stream_access_token, estimated_input_tokens=_est_input):
                         # 内部元数据信号（不是 SSE 事件），不 yield 给客户端
                         if chunk.startswith("\x00"):
                             if "__QUOTA_LIMIT__" in chunk:
@@ -947,6 +925,17 @@ async def anthropic_messages(request: Request) -> Any:
 
     final_payload, hit_quota_limit = _anthropic_nonstream_response_from_bridge(bridge_resp, req.model)
 
+    # 补充 input_tokens 估算（Warp 不返回真实值）
+    usage_dict = final_payload.get("usage", {})
+    if not usage_dict.get("input_tokens"):
+        usage_dict["input_tokens"] = _estimate_input_tokens(req)
+        final_payload["usage"] = usage_dict
+    # output_tokens 兜底：用响应文本长度估算
+    if not usage_dict.get("output_tokens"):
+        _out_chars = sum(len(b.get("text", "")) for b in final_payload.get("content", []) if b.get("type") == "text")
+        usage_dict["output_tokens"] = max(1, _out_chars // 4)
+        final_payload["usage"] = usage_dict
+
     # 额度耗尽 → 标记 exhausted
     if hit_quota_limit:
         logger.warning("[Anthropic] non-stream quota_limit hit on account_id=%d, marking exhausted", account_id)
@@ -1022,7 +1011,7 @@ async def build_streaming_response_for_account(
             name=msg.get("name"),
         ))
 
-    history_text = _serialize_history_to_text(chat_messages)
+    history_text = serialize_history_to_text(chat_messages, max_tool_chars=HISTORY_TOOL_RESULT_MAX_CHARS)
     if history_text:
         if final_system:
             final_system = final_system + "\n\n" + history_text

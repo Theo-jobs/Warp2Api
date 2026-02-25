@@ -373,7 +373,7 @@
                     <th><input type="checkbox" id="select-all" onclick="toggleSelectAll(this)"></th>
                     <th class="sortable" data-key="id" onclick="sortTable('id')">ID<span class="sort-arrow"></span></th>
                     <th>邮箱</th>
-                    <th>Local ID</th>
+                    <th>认证</th>
                     <th class="sortable" data-key="status" onclick="sortTable('status')">状态<span class="sort-arrow"></span></th>
                     <th class="sortable" data-key="remaining_limit" onclick="sortTable('remaining_limit')">额度<span class="sort-arrow"></span></th>
                     <th class="sortable" data-key="token_expires_at" onclick="sortTable('token_expires_at')">Token 过期<span class="sort-arrow"></span></th>
@@ -731,17 +731,19 @@
                 const toggleTarget = isInactive ? 'available' : 'disabled';
                 const statusLabel = statusToChinese(statusValue);
                 const statusCssClass = statusValue === 'token_expired' ? 'token-expired' : statusValue;
-                const localIdText = typeof account.local_id === 'string' && account.local_id
-                    ? `${account.local_id.substring(0, 20)}...`
-                    : '-';
+                const apiKey = account.api_key || '';
+                const hasWkKey = apiKey.startsWith('wk-');
+                const authBadge = hasWkKey
+                    ? '<span class="status-badge" style="background:#e8f5e9;color:#2e7d32;">🔑 API Key</span>'
+                    : '<span class="status-badge" style="background:#e3f2fd;color:#1565c0;">🔒 JWT</span>';
                 tr.innerHTML = `
                     <td><input type="checkbox" class="row-checkbox" data-id="${accountId}" onchange="updateBatchBar()"></td>
                     <td>${accountId}</td>
                     <td>${escapeHtml(account.email ?? '')}</td>
-                    <td>${escapeHtml(localIdText)}</td>
+                    <td>${authBadge}</td>
                     <td><span class="status-badge status-${statusCssClass}" data-status="${statusValue}">${statusLabel}</span></td>
                     <td>${renderQuotaCell(account)}</td>
-                    <td>${renderTokenExpiry(account.token_expires_at)}</td>
+                    <td>${hasWkKey ? '<span class="token-expiry ok">永不过期</span>' : renderTokenExpiry(account.token_expires_at)}</td>
                     <td>${account.use_count || 0}</td>
                     <td>${account.last_check ? new Date(account.last_check).toLocaleString('zh-CN') : '-'}</td>
                     <td style="white-space:nowrap;">
@@ -749,7 +751,7 @@
                             ${toggleBtnText}
                         </button>
                         <button class="btn-sm btn-warning" onclick="refreshQuota(${accountId}, this)">检查额度</button>
-                        <button class="btn-sm" style="background:#e67e22;color:#fff;" onclick="forceRefreshSingle(${accountId}, this)">刷新Token</button>
+                        ${hasWkKey ? '' : '<button class="btn-sm" style="background:#e67e22;color:#fff;" onclick="forceRefreshSingle(' + accountId + ', this)">刷新Token</button>'}
                         <button class="btn-sm" style="background:#dc3545;color:#fff;" onclick="deleteAccount(${accountId}, '${escapeHtml(account.email ?? '')}')">删除</button>
                     </td>
                 `;

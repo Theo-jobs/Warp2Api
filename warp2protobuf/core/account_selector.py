@@ -84,6 +84,8 @@ class AccountSelector:
         self.store = AccountStore(db_path)
         self.db_path = self.store.db_path
         self._round_robin_cursor: int = 0
+        # 使用 threading.Lock 而非 asyncio.Lock：保护的是纯内存操作（cursor 自增），
+        # 且 select_account 是同步方法，threading.Lock 在此场景下正确且高效。
         self._rr_lock = threading.Lock()
         self._ensure_priority_column()
 
@@ -112,7 +114,8 @@ class AccountSelector:
             "status = 'available'",
             "(total_limit - used_limit) > 0",
             # token_expires_at=0 表示未记录过期时间（放行，由 TokenManager 实时判断）
-            "(token_expires_at = 0 OR token_expires_at > ?)",
+            # 有 wk-1 API key 的账号不受 token 过期限制
+            "(token_expires_at = 0 OR token_expires_at > ? OR (api_key IS NOT NULL AND api_key != ''))",
         ]
         params: list = [threshold]
 

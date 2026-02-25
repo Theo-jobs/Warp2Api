@@ -8,6 +8,15 @@ from .state import STATE, ensure_tool_ids
 from .helpers import normalize_content_to_list, segments_to_text, segments_to_warp_results, extract_images_from_segments
 from .models import ChatMessage
 
+# 工具限制提示（注入 system prompt，防止模型调用不支持的工具）
+TOOL_RESTRICTION_ALERT = """<ALERT>you are not allowed to call following tools:  - `read_files`
+- `write_files`
+- `run_commands`
+- `list_files`
+- `str_replace_editor`
+- `ask_followup_question`
+- `attempt_completion`</ALERT>"""
+
 
 def packet_template() -> Dict[str, Any]:
     return {
@@ -113,13 +122,7 @@ def attach_user_and_tools_to_inputs(packet: Dict[str, Any], history: List[ChatMe
         if system_prompt_text:
             user_query_payload["referenced_attachments"] = {
                 "SYSTEM_PROMPT": {
-                    "plain_text": f"""<ALERT>you are not allowed to call following tools:  - `read_files`
-- `write_files`
-- `run_commands`
-- `list_files`
-- `str_replace_editor`
-- `ask_followup_question`
-- `attempt_completion`</ALERT>{system_prompt_text}"""
+                    "plain_text": f"{TOOL_RESTRICTION_ALERT}{system_prompt_text}"
                     }
                 }
         # Vision: 扫描所有历史消息提取图像（reorder 可能将多模态消息拆分）
@@ -178,13 +181,7 @@ def attach_user_and_tools_to_inputs(packet: Dict[str, Any], history: List[ChatMe
         if system_prompt_text:
             user_query_payload["referenced_attachments"] = {
                 "SYSTEM_PROMPT": {
-                    "plain_text": f"""<ALERT>you are not allowed to call following tools:  - `read_files`
-- `write_files`
-- `run_commands`
-- `list_files`
-- `str_replace_editor`
-- `ask_followup_question`
-- `attempt_completion`</ALERT>{system_prompt_text}"""
+                    "plain_text": f"{TOOL_RESTRICTION_ALERT}{system_prompt_text}"
                     }
                 }
         packet["input"]["user_inputs"]["inputs"].append({"user_query": user_query_payload})

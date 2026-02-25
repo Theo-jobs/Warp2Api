@@ -8,7 +8,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
-import requests
+import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
@@ -24,6 +24,7 @@ from .bridge import initialize_once
 from .sse_transform import stream_openai_sse
 from .auth import authenticate_request
 from .token_manager import TokenManager
+from .utils import serialize_history_to_text
 
 from warp2protobuf.config.models import resolve_model, get_all_unique_models as _get_all_models
 from warp2protobuf.config.settings import (
@@ -50,58 +51,6 @@ def _extract_http_status_from_error_text(error_text: str) -> Optional[int]:
         return status_code
     return None
 
-
-def _serialize_history_to_text(history: List[ChatMessage]) -> Optional[str]:
-    """将多轮对话历史序列化为文本，用于注入 system prompt。
-
-    跳过 system 消息和尾部的当前输入（user 或连续 tool_result + 对应 assistant）。
-    """
-    non_system = [m for m in history if m.role != "system"]
-    if len(non_system) <= 1:
-        return None  # 没有历史
-
-    # 计算尾部当前输入的范围（与 attach_user_and_tools_to_inputs 对齐）
-    if non_system[-1].role == "tool":
-        # 尾部连续 tool_result 全部跳过（它们作为结构化 tool_call_result 输入）
-        split_idx = len(non_system)
-        while split_idx > 0 and non_system[split_idx - 1].role == "tool":
-            split_idx -= 1
-        # 注意：保留 assistant(tool_calls) 在历史中！
-        # Warp 需要知道是哪个 assistant 调了什么工具
-        history_msgs = non_system[:split_idx]
-    else:
-        # 最后一条 user 是当前输入
-        history_msgs = non_system[:-1]
-
-    if not history_msgs:
-        return None
-
-    lines: List[str] = []
-    for m in history_msgs:
-        text = segments_to_text(normalize_content_to_list(m.content))
-        if m.role == "user":
-            lines.append(f"User: {text}")
-        elif m.role == "assistant":
-            if text:
-                lines.append(f"Assistant: {text}")
-            for tc in (m.tool_calls or []):
-                fn = (tc.get("function") or {})
-                tc_name = fn.get("name", "unknown")
-                tc_args = fn.get("arguments", "{}")
-                lines.append(f"Assistant: [called tool: {tc_name}({tc_args})]")
-        elif m.role == "tool":
-            max_chars = max(1, HISTORY_TOOL_RESULT_MAX_CHARS)
-            lines.append(
-                f"Tool result ({m.tool_call_id or 'unknown'}): {text[:max_chars]}"
-            )
-    if not lines:
-        return None
-    return (
-        "[Previous conversation]\n"
-        + "\n".join(lines)
-        + "\n[End of previous conversation]\n\n"
-        + "Continue the conversation naturally based on the above context."
-    )
 
 
 @router.get("/")
@@ -247,7 +196,7 @@ async def chat_completions(req: ChatCompletionsRequest, request: Request = None)
 
     # 多轮对话：将历史序列化为文本注入 system prompt（T4 方案）
     # 每次都当新会话处理，空 task_context，完全无状态
-    history_text = _serialize_history_to_text(history)
+    history_text = serialize_history_to_text(history, max_tool_chars=HISTORY_TOOL_RESULT_MAX_CHARS)
     if history_text:
         if system_prompt_text:
             system_prompt_text = system_prompt_text + "\n\n" + history_text
@@ -326,19 +275,20 @@ async def chat_completions(req: ChatCompletionsRequest, request: Request = None)
         return StreamingResponse(_agen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
 
     # 非流式请求
-    def _post_once(_token: str) -> requests.Response:
-        return requests.post(
-            f"{BRIDGE_BASE_URL}/api/warp/send_stream",
-            json={
-                "json_data": packet,
-                "message_type": "warp.multi_agent.v1.Request",
-                "access_token": _token,
-            },
-            timeout=(5.0, 180.0),
-        )
+    async def _post_once(_token: str) -> httpx.Response:
+        timeout = httpx.Timeout(180.0, connect=5.0)
+        async with httpx.AsyncClient(timeout=timeout, trust_env=True) as client:
+            return await client.post(
+                f"{BRIDGE_BASE_URL}/api/warp/send_stream",
+                json={
+                    "json_data": packet,
+                    "message_type": "warp.multi_agent.v1.Request",
+                    "access_token": _token,
+                },
+            )
 
     try:
-        resp = _post_once(valid_token)
+        resp = await _post_once(valid_token)
 
         if resp.status_code == 429:
             # 标记当前账号失败，尝试换号重试
@@ -349,7 +299,7 @@ async def chat_completions(req: ChatCompletionsRequest, request: Request = None)
             if retry_account and retry_account["id"] != account_id:
                 retry_token = await token_mgr.get_valid_token(retry_account)
                 if retry_token:
-                    resp = _post_once(retry_token)
+                    resp = await _post_once(retry_token)
                     account_id = retry_account["id"]
 
         if resp.status_code != 200:

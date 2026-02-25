@@ -317,6 +317,96 @@ async def _step4_bind_email(session_token: str, email: str, password: str) -> tu
         return "", ""
 
 
+_SEND_OOB_URL = f"https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key={FIREBASE_API_KEY}"
+_TEMPMAIL_GEN_URL = "https://api.tempmail.lol/generate"
+
+
+async def _step4b_verify_email(id_token: str, email: str, refresh_tok: str) -> tuple[str, str]:
+    """Step 4b: 通过临时邮箱完成 email 验证，返回 (verified_id_token, verified_refresh_token)。
+
+    流程：改绑临时邮箱 → 发送验证邮件 → 读取邮件 → 确认验证 → 刷新 token
+    如果失败，返回空字符串（非致命，不阻塞注册）。
+    """
+    import re
+    import asyncio
+    import time as _time
+
+    try:
+        client_kwargs: dict = {"timeout": httpx.Timeout(30.0), "verify": TLS_VERIFY, "trust_env": False}
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            # 1) 创建临时邮箱
+            resp = await client.get(_TEMPMAIL_GEN_URL, timeout=15.0)
+            resp.raise_for_status()
+            mail_data = resp.json()
+            temp_email = mail_data["address"]
+            mail_token = mail_data["token"]
+            logger.info("[Register] Step4b: temp email=%s", temp_email)
+
+            # 2) 改绑邮箱到临时地址
+            rebind_payload = {"idToken": id_token, "email": temp_email, "returnSecureToken": True}
+            _proxy = proxy_for_url(_UPDATE_URL)
+            ckw: dict = {"timeout": httpx.Timeout(30.0), "verify": TLS_VERIFY, "trust_env": False}
+            if _proxy:
+                ckw["proxy"] = _proxy
+            async with httpx.AsyncClient(**ckw) as fc:
+                resp = await fc.post(_UPDATE_URL, json=rebind_payload)
+            if resp.status_code != 200:
+                logger.warning("[Register] Step4b rebind failed: HTTP %d", resp.status_code)
+                return "", ""
+            rebind_data = resp.json()
+            work_token = rebind_data.get("idToken", "") or id_token
+            work_refresh = rebind_data.get("refreshToken", "") or refresh_tok
+
+            # 3) 发送验证邮件
+            async with httpx.AsyncClient(**ckw) as fc:
+                resp = await fc.post(_SEND_OOB_URL, json={"requestType": "VERIFY_EMAIL", "idToken": work_token})
+            if resp.status_code != 200:
+                logger.warning("[Register] Step4b sendOobCode failed: HTTP %d", resp.status_code)
+                return "", ""
+
+            # 4) 轮询收件箱（最多60秒）
+            deadline = _time.time() + 60
+            msg = None
+            inbox_url = f"https://api.tempmail.lol/auth/{mail_token}"
+            while _time.time() < deadline:
+                await asyncio.sleep(5)
+                resp = await client.get(inbox_url, timeout=15.0)
+                emails = resp.json().get("email", [])
+                if emails:
+                    msg = emails[0]
+                    break
+
+            if not msg:
+                logger.warning("[Register] Step4b: no verification email received (timeout)")
+                return "", ""
+
+            # 5) 提取 oobCode
+            html = msg.get("html", "") or msg.get("body", "") or msg.get("text", "")
+            oob_match = re.search(r'oobCode=([^&"\'>\s]+)', html)
+            if not oob_match:
+                logger.warning("[Register] Step4b: no oobCode in email body")
+                return "", ""
+            oob_code = oob_match.group(1)
+
+            # 6) 确认验证
+            async with httpx.AsyncClient(**ckw) as fc:
+                resp = await fc.post(_UPDATE_URL, json={"oobCode": oob_code})
+            if resp.status_code != 200:
+                logger.warning("[Register] Step4b confirm failed: HTTP %d", resp.status_code)
+                return "", ""
+
+            # 7) 刷新 token
+            await asyncio.sleep(2)
+            from .auth import refresh_access_token_with_refresh_token
+            final_token = await refresh_access_token_with_refresh_token(work_refresh)
+            logger.info("[Register] Step4b: email verified OK, temp_email=%s", temp_email)
+            return final_token, work_refresh
+
+    except Exception as e:
+        logger.warning("[Register] Step4b verify email error (non-fatal): %s", str(e)[:200])
+        return "", ""
+
+
 async def _step5_get_or_create_user(id_token: str) -> tuple[str, bool]:
     """Step 5: GetOrCreateUser GraphQL → 在 Warp 后端激活用户（关键步骤！）
 
@@ -463,6 +553,16 @@ async def register_account(
         # 绑定成功时用新 id_token 激活，否则用原始 session_token
         if new_id_token:
             activation_token = new_id_token
+
+        # Step 3b: 通过临时邮箱验证 email（Warp 要求 email_verified=true）
+        verified_token, verified_refresh = await _step4b_verify_email(
+            activation_token, email, final_refresh,
+        )
+        if verified_token:
+            activation_token = verified_token
+            logger.info("[Register] Step3b email verified via temp mailbox")
+        if verified_refresh:
+            final_refresh = verified_refresh
 
     # Step 4: 在 Warp 后端激活用户（关键步骤！缺少此步 AI 请求会 400）
     await _step5_get_or_create_user(activation_token)

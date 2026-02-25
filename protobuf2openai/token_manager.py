@@ -29,7 +29,7 @@ from warp2protobuf.core.logging import logger
 TOKEN_LIFETIME_SECONDS = 3600
 # 提前多少秒开始预刷新（缩短到 3 分钟，减少不必要的刷新）
 PRE_REFRESH_BUFFER_SECONDS = 180
-# 活跃账号窗口：仅预刷新最近 2 小时内使用过的账号
+# 活跃账号窗口（已不再用于预刷新过滤，保留供其他模块参考）
 ACTIVE_ACCOUNT_WINDOW_SECONDS = 7200
 # Jitter 最大偏移（秒），防止雷群效应
 MAX_JITTER_SECONDS = 120
@@ -99,20 +99,38 @@ class TokenManager:
             remaining,
         )
 
-    async def get_valid_token(self, account: Dict) -> Optional[str]:
-        """获取账号的有效 id_token，过期则自动刷新。
+    @classmethod
+    def clear_firebase_block(cls) -> bool:
+        """清除 Firebase 全局限流标记。返回之前是否处于限流状态。"""
+        was_blocked = cls.is_firebase_blocked()
+        cls._firebase_blocked_until = 0.0
+        return was_blocked
 
-        - Firebase 全局限流期间：仅返回未过期的 token，过期则返回 None（让调用方换号）
-        - 单账号冷却期间：仅返回未过期的 token，过期则返回 None
-        - 正常情况：过期则刷新
+    async def get_valid_token(self, account: Dict) -> Optional[str]:
+        """获取账号的有效 access token，过期则自动刷新。
+
+        优先级：
+        1. wk-1.xxx API key（永不过期，无需 Firebase）
+        2. 未过期的 Firebase id_token
+        3. 刷新 Firebase id_token
 
         Args:
-            account: 从 DB 查出的账号字典，需包含 id, id_token, refresh_token, email
+            account: 从 DB 查出的账号字典，需包含 id, id_token, refresh_token, email, api_key
 
         Returns:
-            有效的 id_token；无法获取有效 token 时返回 None
+            有效的 token（wk-1 key 或 id_token）；无法获取时返回 None
         """
         account_id = account["id"]
+
+        # ── wk-1.xxx API key 优先：不需要 Firebase JWT ──
+        api_key = account.get("api_key", "")
+        if api_key and api_key.startswith("wk-"):
+            logger.debug(
+                "[TokenManager] account_id=%d 使用 wk API key（跳过 Firebase）",
+                account_id,
+            )
+            return api_key
+
         id_token = account.get("id_token", "")
         refresh_token = account.get("refresh_token", "")
 
@@ -333,7 +351,7 @@ class TokenManager:
         with get_connection(str(self.db_path)) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT id, email, id_token, refresh_token FROM accounts WHERE status = 'available'"
+                "SELECT id, email, id_token, refresh_token, api_key FROM accounts WHERE status = 'available'"
             ).fetchall()
 
         stats["total"] = len(rows)
@@ -349,6 +367,12 @@ class TokenManager:
             account = dict(row)
             account_id = account["id"]
             id_token = account.get("id_token", "")
+
+            # wk-1 API key 账号不需要 Firebase 刷新
+            api_key = account.get("api_key", "") or ""
+            if api_key.startswith("wk-"):
+                stats["skipped"] += 1
+                continue
 
             # 未过期的跳过
             if id_token and not is_token_expired(id_token, buffer_minutes=10):
@@ -444,12 +468,12 @@ class TokenManager:
             await asyncio.sleep(next_interval)
 
     async def _refresh_expiring_tokens(self) -> int:
-        """扫描即将过期的活跃账号 token，逐个刷新。
+        """扫描即将过期的账号 token，逐个刷新。
 
-        优化策略：
-        1. 仅刷新最近 2 小时内使用过的账号（活跃账号追踪）
-        2. 预刷新窗口缩短到 3 分钟（减少不必要刷新）
-        3. 每个账号加随机 Jitter（防雷群效应）
+        策略：
+        1. 刷新所有 available 且即将过期（3 分钟内）的账号，不限活跃窗口
+        2. 每个账号加随机 Jitter（防雷群效应）
+        3. 每轮最多 10 个，防止单轮刷新过多
 
         Returns:
             建议的下次检查间隔（秒）。
@@ -460,21 +484,18 @@ class TokenManager:
 
         now = time.time()
         threshold = now + PRE_REFRESH_BUFFER_SECONDS
-        active_since = now - ACTIVE_ACCOUNT_WINDOW_SECONDS
 
         with get_connection(str(self.db_path)) as conn:
             conn.row_factory = sqlite3.Row
-            # 仅查询活跃账号（last_used 在 2 小时内）且即将过期的
+            # 查询所有 available 且即将过期的账号（不再限制活跃窗口）
             rows = conn.execute(
                 """
-                SELECT id, email, id_token, refresh_token, token_expires_at, last_used
+                SELECT id, email, id_token, refresh_token, token_expires_at, last_used, api_key
                 FROM accounts
                 WHERE status = 'available'
                   AND refresh_token IS NOT NULL
                   AND refresh_token != ''
-                  AND (
-                    last_used IS NOT NULL AND last_used > ?
-                  )
+                  AND (api_key IS NULL OR api_key = '' OR NOT api_key LIKE 'wk-%')
                   AND (
                     (token_expires_at > 0 AND token_expires_at < ?)
                     OR (token_expires_at = 0 AND id_token IS NOT NULL AND id_token != '')
@@ -482,16 +503,20 @@ class TokenManager:
                 ORDER BY token_expires_at ASC
                 LIMIT 10
                 """,
-                (datetime.fromtimestamp(active_since).isoformat(), threshold),
+                (threshold,),
             ).fetchall()
 
         if not rows:
             return self._calc_next_check_interval()
 
         # 过滤：token_expires_at=0 的需要额外检查是否真的过期
+        # 有 wk-1 API key 的账号跳过 Firebase 刷新
         to_refresh = []
         for row in rows:
             account = dict(row)
+            api_key = account.get("api_key", "") or ""
+            if api_key.startswith("wk-"):
+                continue  # wk-1 key 不需要 Firebase 刷新
             if account["token_expires_at"] > 0:
                 to_refresh.append(account)
             else:
@@ -504,7 +529,7 @@ class TokenManager:
 
         active_count = len(to_refresh)
         logger.info(
-            "[TokenManager] 发现 %d 个活跃账号需要预刷新",
+            "[TokenManager] 发现 %d 个账号即将过期，开始预刷新",
             active_count,
         )
 
@@ -610,19 +635,19 @@ class TokenManager:
         if self.is_firebase_blocked():
             return
 
-        min_age = time.time() - 4 * 3600  # 至少 4 小时前标记/检查的才查
+        min_age = time.time() - 1 * 3600  # 至少 1 小时前标记/检查的才查
 
         with get_connection(str(self.db_path)) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 """SELECT id, email, refresh_token, id_token, token_expires_at, status,
-                          total_limit, used_limit
+                          total_limit, used_limit, api_key
                    FROM accounts
                    WHERE status IN ('exhausted', 'token_expired')
                      AND refresh_token IS NOT NULL AND refresh_token != ''
                      AND (updated_at IS NULL OR updated_at < ?)
                    ORDER BY updated_at ASC
-                   LIMIT 2""",
+                   LIMIT 5""",
                 (datetime.fromtimestamp(min_age).isoformat(),),
             ).fetchall()
 
@@ -647,7 +672,11 @@ class TokenManager:
                 used_limit = row["used_limit"] or 0
                 quota_fully_used = total_limit > 0 and used_limit >= total_limit
 
-                if quota_fully_used:
+                # wk-1 API key 账号：直接用 api_key 查额度，无需 Firebase
+                row_api_key = (row["api_key"] or "") if "api_key" in row.keys() else ""
+                if row_api_key.startswith("wk-"):
+                    access_token = row_api_key
+                elif quota_fully_used:
                     # 额度确实用完（如 300/300）：不刷新 token，用现有 token 查额度即可
                     # 如果 token 也过期了，跳过（等额度重置周期后再查）
                     token_valid = id_token and (token_expires_at == 0 or token_expires_at > time.time())

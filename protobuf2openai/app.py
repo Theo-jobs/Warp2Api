@@ -115,7 +115,7 @@ def _fetch_account_tokens(db_path: Path, account_id: int) -> dict[str, Any] | No
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id, email, id_token, refresh_token, status FROM accounts WHERE id = ?",
+            "SELECT id, email, id_token, refresh_token, status, api_key FROM accounts WHERE id = ?",
             (account_id,),
         )
         row = cursor.fetchone()
@@ -429,8 +429,14 @@ def _save_refreshed_token(account_id: int, new_token: str) -> None:
 async def _resolve_quota_with_token_strategy(
     id_token: str | None,
     refresh_token: str | None,
+    api_key: str | None = None,
 ) -> tuple[dict[str, Any], str | None]:
     """查询额度，如果触发了 token 刷新则一并返回新 token。
+
+    优先级：
+    1. wk-1.xxx API key（永不过期，无需 Firebase）
+    2. 未过期的 Firebase id_token
+    3. 刷新 Firebase id_token
 
     Returns:
         (quota_info, refreshed_token) — refreshed_token 为 None 表示未刷新。
@@ -441,6 +447,11 @@ async def _resolve_quota_with_token_strategy(
     token = ""
     refreshed_token: str | None = None
     from_id_token = False
+
+    # wk-1 API key 优先：直接用于额度查询，无需 Firebase
+    if api_key and api_key.startswith("wk-"):
+        quota = await get_request_limit_info(api_key)
+        return quota, None
 
     # 检查 Firebase 全局限流，避免绕过 TokenManager 直接触发 429
     token_mgr = TokenManager.get_instance(ACCOUNT_DB_PATH)
@@ -510,8 +521,9 @@ async def batch_verify_quota() -> dict[str, Any]:
 
         id_token = row["id_token"]
         refresh_token = row["refresh_token"]
+        row_api_key = row.get("api_key", "") or ""
 
-        if not id_token and not refresh_token:
+        if not id_token and not refresh_token and not row_api_key.startswith("wk-"):
             results["invalid"] += 1
             results["details"].append({
                 "id": account_id,
@@ -522,7 +534,7 @@ async def batch_verify_quota() -> dict[str, Any]:
             continue
 
         try:
-            quota_info, new_token = await _resolve_quota_with_token_strategy(id_token, refresh_token)
+            quota_info, new_token = await _resolve_quota_with_token_strategy(id_token, refresh_token, api_key=row_api_key)
             total_limit = quota_info["request_limit"]
             used_limit = quota_info["used"]
             remaining = quota_info.get("remaining", total_limit - used_limit)
@@ -597,8 +609,9 @@ async def verify_single_quota(account_id: int) -> dict[str, Any]:
     email = row["email"]
     id_token = row["id_token"]
     refresh_token = row["refresh_token"]
+    row_api_key = row.get("api_key", "") or ""
 
-    if not id_token and not refresh_token:
+    if not id_token and not refresh_token and not row_api_key.startswith("wk-"):
         return {
             "success": True,
             "result": {
@@ -610,7 +623,7 @@ async def verify_single_quota(account_id: int) -> dict[str, Any]:
         }
 
     try:
-        quota_info, new_token = await _resolve_quota_with_token_strategy(id_token, refresh_token)
+        quota_info, new_token = await _resolve_quota_with_token_strategy(id_token, refresh_token, api_key=row_api_key)
         total_limit = quota_info["request_limit"]
         used_limit = quota_info["used"]
         remaining = quota_info.get("remaining", total_limit - used_limit)
@@ -665,8 +678,7 @@ async def force_refresh_single(account_id: int) -> dict[str, Any]:
 
     token_mgr = TokenManager.get_instance(ACCOUNT_DB_PATH)
     # 清除全局 Firebase 限流 + 该账号的失败冷却
-    was_blocked = token_mgr.is_firebase_blocked()
-    token_mgr._firebase_blocked_until = 0.0
+    was_blocked = token_mgr.clear_firebase_block()
     token_mgr._refresh_failures.pop(account_id, None)
 
     try:
@@ -867,8 +879,7 @@ async def force_token_refresh() -> dict[str, Any]:
         raise HTTPException(status_code=403, detail="Account management is disabled")
     token_mgr = TokenManager.get_instance(ACCOUNT_DB_PATH)
     # 清除 Firebase 限流标记
-    was_blocked = token_mgr.is_firebase_blocked()
-    token_mgr._firebase_blocked_until = 0.0
+    was_blocked = token_mgr.clear_firebase_block()
     token_mgr._refresh_failures.clear()
     logger.info("[ForceRefresh] Firebase 限流标记已清除 (was_blocked=%s)", was_blocked)
     # 执行全量刷新

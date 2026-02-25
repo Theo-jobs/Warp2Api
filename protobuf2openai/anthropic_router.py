@@ -95,17 +95,19 @@ def _estimate_input_tokens(req: "AnthropicMessagesRequest") -> int:
             total_chars += len(req.system)
         elif isinstance(req.system, list):
             for block in req.system:
-                if isinstance(block, dict):
-                    total_chars += len(block.get("text", ""))
-    # messages
+                text = getattr(block, "text", "") if not isinstance(block, dict) else block.get("text", "")
+                total_chars += len(text)
+    # messages（AnthropicMessage 是 Pydantic 对象，用属性访问）
     for msg in req.messages:
-        content = msg.get("content", "")
+        content = msg.content if hasattr(msg, "content") else ""
         if isinstance(content, str):
             total_chars += len(content)
         elif isinstance(content, list):
             for block in content:
                 if isinstance(block, dict):
                     total_chars += len(block.get("text", ""))
+                elif hasattr(block, "text"):
+                    total_chars += len(block.text)
     return max(1, total_chars // 4)
 
 

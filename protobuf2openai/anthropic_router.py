@@ -740,13 +740,9 @@ async def anthropic_messages(request: Request) -> Any:
     # --- Build packet (mirrors router.py pattern) ---
     packet = packet_template()
 
-    # 有状态对话模式：复用 conversation_id（如果有），每次请求独立 task_id
+    # 每次请求独立 task_id（Warp bridge 不支持 metadata.conversation_id，保持无状态）
     _new_task_id = str(uuid.uuid4())
     packet["task_context"] = {"active_task_id": _new_task_id}
-    # 注入 conversation_id 到 metadata（如果 warmup 或之前的请求已获取）
-    if STATE.conversation_id:
-        packet.setdefault("metadata", {})["conversation_id"] = STATE.conversation_id
-        logger.debug("[Anthropic] 复用 conversation_id=%s, new task_id=%s", STATE.conversation_id, _new_task_id)
 
     # Set model (key is "base", not "base_model")
     packet["settings"]["model_config"]["base"] = warp_model

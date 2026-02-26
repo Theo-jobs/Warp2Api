@@ -331,10 +331,20 @@ def _process_warp_event(ev: dict, state: AnthropicSseState) -> list[str]:
                         parts.append(_emit_text_delta(state, text_content))
                         state.output_tokens += max(1, len(text_content) // 4)
 
-        # ---- 未识别的 action 类型：记录警告，防止内容静默丢失 ----
+        # ---- Warp 内部控制事件（不含用户文本，安全忽略） ----
+        _KNOWN_CONTROL_ACTIONS = {
+            "commit_transaction", "commitTransaction",
+            "update_task_description", "updateTaskDescription",
+            "update_task_message", "updateTaskMessage",
+            "update_task_status", "updateTaskStatus",
+            "set_cursor_position", "setCursorPosition",
+        }
         if not _action_handled:
-            _action_keys = list(action.keys()) if isinstance(action, dict) else type(action).__name__
-            logger.warning("[anthropic_sse] 未识别的 action 类型，内容可能丢失: keys=%s", _action_keys)
+            _action_keys = set(action.keys()) if isinstance(action, dict) else set()
+            if _action_keys & _KNOWN_CONTROL_ACTIONS:
+                logger.debug("[anthropic_sse] 忽略 Warp 控制事件: keys=%s", list(_action_keys))
+            else:
+                logger.warning("[anthropic_sse] 未识别的 action 类型，内容可能丢失: keys=%s", list(_action_keys))
 
     return parts
 

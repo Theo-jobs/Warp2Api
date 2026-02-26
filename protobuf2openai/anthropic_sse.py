@@ -288,38 +288,8 @@ def _process_warp_event(ev: dict, state: AnthropicSseState) -> list[str]:
             _action_handled = True
             messages = messages_data.get("messages", [])
             for msg in messages:
-                # 优先检查 tool_call.call_mcp_tool（Warp protobuf 格式）
                 tool_call = _get(msg, "tool_call", "toolCall") or {}
-                call_mcp = _get(tool_call, "call_mcp_tool", "callMcpTool") or {}
-                if isinstance(call_mcp, dict) and call_mcp.get("name"):
-                    name = call_mcp["name"]
-                    try:
-                        args_obj = call_mcp.get("args", {}) or {}
-                        args_str = json.dumps(args_obj, ensure_ascii=False)
-                    except Exception:
-                        args_str = "{}"
-                    tool_call_id = tool_call.get("tool_call_id") or _gen_tool_use_id()
-
-                    # 关闭当前打开的 block
-                    if state.block_type == "text":
-                        parts.append(_close_text_block(state))
-                    elif state.block_type == "tool_use":
-                        parts.append(_close_tool_use_block(state))
-
-                    # 打开新的 tool_use block
-                    anthropic_tool_id = _gen_tool_use_id()
-                    parts.append(_open_tool_use_block(state, anthropic_tool_id, name))
-
-                    # 发射 input_json_delta
-                    if args_str and args_str != "{}":
-                        parts.append(_emit_tool_input_delta(state, args_str))
-                        state.input_json_buf = args_str
-
-                    # 立即关闭 tool_use block（bridge 一次性给出完整 arguments）
-                    parts.append(_close_tool_use_block(state))
-
-                    state.output_tokens += max(1, len(args_str) // 4)
-                else:
+                if not isinstance(tool_call, dict) or not tool_call:
                     # 非 tool_call 消息，可能包含 agent_output 文本
                     agent_output = _get(msg, "agent_output", "agentOutput") or {}
                     text_content = agent_output.get("text", "")
@@ -330,6 +300,75 @@ def _process_warp_event(ev: dict, state: AnthropicSseState) -> list[str]:
                             parts.append(_open_text_block(state))
                         parts.append(_emit_text_delta(state, text_content))
                         state.output_tokens += max(1, len(text_content) // 4)
+                    continue
+
+                # --- 提取 tool_call_id ---
+                tc_id = (tool_call.get("tool_call_id")
+                         or tool_call.get("toolCallId")
+                         or _gen_tool_use_id())
+
+                # --- 识别工具类型和参数 ---
+                # ToolCall 是 oneof tool，包含 13 种变体（proto task.proto:114-129）
+                # 优先检查 call_mcp_tool（有显式 name/args 字段）
+                tool_name: str | None = None
+                args_str = "{}"
+
+                call_mcp = _get(tool_call, "call_mcp_tool", "callMcpTool") or {}
+                if isinstance(call_mcp, dict) and call_mcp.get("name"):
+                    tool_name = call_mcp["name"]
+                    try:
+                        args_str = json.dumps(call_mcp.get("args", {}) or {}, ensure_ascii=False)
+                    except Exception:
+                        args_str = "{}"
+                else:
+                    # 通用提取：遍历 tool_call 的所有 key，
+                    # 跳过 tool_call_id/toolCallId，第一个 dict 值即为工具
+                    _skip = {"tool_call_id", "toolCallId"}
+                    for _k, _v in tool_call.items():
+                        if _k in _skip:
+                            continue
+                        if isinstance(_v, dict):
+                            tool_name = _k
+                            try:
+                                args_str = json.dumps(_v, ensure_ascii=False)
+                            except Exception:
+                                args_str = "{}"
+                            break
+
+                if not tool_name:
+                    # tool_call 存在但无法识别工具类型，回退为文本
+                    agent_output = _get(msg, "agent_output", "agentOutput") or {}
+                    text_content = agent_output.get("text", "")
+                    if text_content:
+                        if state.block_type == "tool_use":
+                            parts.append(_close_tool_use_block(state))
+                        if state.block_type != "text":
+                            parts.append(_open_text_block(state))
+                        parts.append(_emit_text_delta(state, text_content))
+                        state.output_tokens += max(1, len(text_content) // 4)
+                    continue
+
+                logger.debug("[anthropic_sse] tool_call 提取: name=%s tc_id=%s args_len=%d", tool_name, tc_id, len(args_str))
+
+                # 关闭当前打开的 block
+                if state.block_type == "text":
+                    parts.append(_close_text_block(state))
+                elif state.block_type == "tool_use":
+                    parts.append(_close_tool_use_block(state))
+
+                # 打开新的 tool_use block
+                anthropic_tool_id = _gen_tool_use_id()
+                parts.append(_open_tool_use_block(state, anthropic_tool_id, tool_name))
+
+                # 发射 input_json_delta
+                if args_str and args_str != "{}":
+                    parts.append(_emit_tool_input_delta(state, args_str))
+                    state.input_json_buf = args_str
+
+                # 立即关闭 tool_use block（bridge 一次性给出完整 arguments）
+                parts.append(_close_tool_use_block(state))
+
+                state.output_tokens += max(1, len(args_str) // 4)
 
         # ---- update_task_message（完整消息更新，包含响应文本） ----
         # 与 warp2protobuf/warp/response.py 对齐：提取 message.agent_output.text

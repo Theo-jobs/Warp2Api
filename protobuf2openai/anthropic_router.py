@@ -477,16 +477,44 @@ def _anthropic_nonstream_response_from_bridge(
                             continue
 
                         tool_call = message.get("tool_call") or message.get("toolCall") or {}
+                        if not isinstance(tool_call, dict) or not tool_call:
+                            # 非 tool_call，提取 agent_output 文本
+                            _ao = (message.get("agent_output") or message.get("agentOutput") or {})
+                            if isinstance(_ao, dict):
+                                _t = _ao.get("text")
+                                if isinstance(_t, str) and _t:
+                                    text_parts.append(_t)
+                            continue
+
+                        tc_id = (tool_call.get("tool_call_id")
+                                 or tool_call.get("toolCallId")
+                                 or f"toolu_{uuid.uuid4().hex[:24]}")
+
+                        # 优先 call_mcp_tool（有显式 name/args）
                         call_mcp = tool_call.get("call_mcp_tool") or tool_call.get("callMcpTool") or {}
                         if isinstance(call_mcp, dict) and call_mcp.get("name"):
                             args_obj = call_mcp.get("args", {})
                             args_obj = args_obj if isinstance(args_obj, dict) else {}
                             tool_blocks.append({
                                 "type": "tool_use",
-                                "id": tool_call.get("tool_call_id") or f"toolu_{uuid.uuid4().hex[:24]}",
-                                "name": call_mcp.get("name", "unknown"),
+                                "id": tc_id,
+                                "name": call_mcp["name"],
                                 "input": args_obj,
                             })
+                        else:
+                            # 通用提取：遍历 tool_call 所有 key，跳过 id 字段
+                            _skip = {"tool_call_id", "toolCallId"}
+                            for _k, _v in tool_call.items():
+                                if _k in _skip:
+                                    continue
+                                if isinstance(_v, dict):
+                                    tool_blocks.append({
+                                        "type": "tool_use",
+                                        "id": tc_id,
+                                        "name": _k,
+                                        "input": _v,
+                                    })
+                                    break
 
                 # update_task_message: 与 warp2protobuf/warp/response.py 对齐
                 update_msg = action.get("update_task_message") or action.get("updateTaskMessage")

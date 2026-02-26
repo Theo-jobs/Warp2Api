@@ -265,9 +265,6 @@ def _process_warp_event(ev: dict, state: AnthropicSseState) -> list[str]:
     actions = _get(client_actions, "actions", "Actions") or []
     for action in actions:
         _action_handled = False
-        # 诊断：记录每个 action 的顶层 key，帮助定位丢失的内容
-        _akeys = list(action.keys()) if isinstance(action, dict) else []
-        logger.info("[anthropic_sse] action keys: %s (payload_len≈%d)", _akeys, len(str(action)[:200]))
         # ---- 文本内容 ----
         append_data = _get(action, "append_to_message_content", "appendToMessageContent")
         if isinstance(append_data, dict):
@@ -344,7 +341,7 @@ def _process_warp_event(ev: dict, state: AnthropicSseState) -> list[str]:
                 _uagent = _get(_umsg, "agent_output", "agentOutput") or {}
                 _utext = _uagent.get("text", "") if isinstance(_uagent, dict) else ""
                 if _utext:
-                    logger.info("[anthropic_sse] update_task_message 提取文本 len=%d", len(_utext))
+                    logger.debug("[anthropic_sse] update_task_message 提取文本 len=%d", len(_utext))
                     if state.block_type == "tool_use":
                         parts.append(_close_tool_use_block(state))
                     if state.block_type != "text":
@@ -360,18 +357,12 @@ def _process_warp_event(ev: dict, state: AnthropicSseState) -> list[str]:
             _ctask = create_task_data.get("task", {})
             if isinstance(_ctask, dict):
                 _cmessages = _ctask.get("messages", []) or []
-                # 诊断：记录 create_task 内部消息结构
-                _msg_keys_summary = []
-                for _cm in _cmessages[:5]:  # 只看前5条
-                    if isinstance(_cm, dict):
-                        _msg_keys_summary.append(list(_cm.keys())[:5])
-                logger.info("[anthropic_sse] create_task: %d messages, sample_keys=%s", len(_cmessages), _msg_keys_summary)
                 for _cmsg in _cmessages:
                     if isinstance(_cmsg, dict):
                         _cagent = _get(_cmsg, "agent_output", "agentOutput") or {}
                         _ctext = _cagent.get("text", "") if isinstance(_cagent, dict) else ""
                         if _ctext:
-                            logger.info("[anthropic_sse] create_task 提取文本 len=%d", len(_ctext))
+                            logger.debug("[anthropic_sse] create_task 提取文本 len=%d", len(_ctext))
                             if state.block_type == "tool_use":
                                 parts.append(_close_tool_use_block(state))
                             if state.block_type != "text":

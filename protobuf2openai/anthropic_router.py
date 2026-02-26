@@ -37,17 +37,19 @@ from .config import BRIDGE_BASE_URL
 from .helpers import normalize_content_to_list, segments_to_text
 from .models import ChatMessage
 from .packets import attach_user_and_tools_to_inputs, packet_template
+from .state import STATE
 from .token_manager import TokenManager
 from .utils import serialize_history_to_text
 
 # ---- 全局 bridge 请求并发控制 ----
 # 限制同时打到 Warp bridge 的请求数，防止多 agent 并发导致 429 雪崩
-_BRIDGE_SEMAPHORE = asyncio.Semaphore(2)
+_BRIDGE_SEMAPHORE = asyncio.Semaphore(5)
 # 全局 bridge 429 冷却（秒）
 _bridge_429_until: float = 0.0
 _bridge_429_lock = asyncio.Lock()
 _BRIDGE_429_COOLDOWN = 30  # bridge 429 后冷却 30 秒
 _BRIDGE_MAX_WAIT = 90  # 排队最大等待时间（秒），超时才返回 429
+_SEMAPHORE_ACQUIRE_TIMEOUT = 60  # semaphore 获取超时（秒），超时返回错误而非空流
 
 from .utils import safe_create_task
 
@@ -738,8 +740,13 @@ async def anthropic_messages(request: Request) -> Any:
     # --- Build packet (mirrors router.py pattern) ---
     packet = packet_template()
 
-    # Stateless mode — 每次请求生成新的 task_id，避免 Warp 400 "conversation" 错误
-    packet["task_context"] = {"active_task_id": str(uuid.uuid4())}
+    # 有状态对话模式：复用 conversation_id（如果有），每次请求独立 task_id
+    _new_task_id = str(uuid.uuid4())
+    packet["task_context"] = {"active_task_id": _new_task_id}
+    # 注入 conversation_id 到 metadata（如果 warmup 或之前的请求已获取）
+    if STATE.conversation_id:
+        packet.setdefault("metadata", {})["conversation_id"] = STATE.conversation_id
+        logger.debug("[Anthropic] 复用 conversation_id=%s, new task_id=%s", STATE.conversation_id, _new_task_id)
 
     # Set model (key is "base", not "base_model")
     packet["settings"]["model_config"]["base"] = warp_model
@@ -801,30 +808,66 @@ async def anthropic_messages(request: Request) -> Any:
             _output_tokens = 0
             _hit_quota = False
 
-            # 全局并发控制：最多 2 个请求同时打到 bridge
-            async with _BRIDGE_SEMAPHORE:
+            # ---- semaphore 获取（带超时 + 心跳保活） ----
+            _acquired = False
+            try:
+                _acquired = _BRIDGE_SEMAPHORE._value > 0  # 快速检查
+                if not _acquired:
+                    logger.info("[Anthropic] semaphore 已满，排队等待（account_id=%d）", _stream_account_id)
+                    # 等待期间每 8 秒发送 SSE comment 保活
+                    _deadline = time.time() + _SEMAPHORE_ACQUIRE_TIMEOUT
+                    while not _acquired:
+                        try:
+                            await asyncio.wait_for(_BRIDGE_SEMAPHORE.acquire(), timeout=8)
+                            _acquired = True
+                        except asyncio.TimeoutError:
+                            if time.time() > _deadline:
+                                logger.warning("[Anthropic] semaphore 等待超时 %ds，account_id=%d", _SEMAPHORE_ACQUIRE_TIMEOUT, _stream_account_id)
+                                yield 'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"Server busy, please retry later"}}\n\n'
+                                return
+                            yield ": keepalive\n\n"
+                else:
+                    await _BRIDGE_SEMAPHORE.acquire()
+                    _acquired = True
+            except Exception as exc:
+                logger.error("[Anthropic] semaphore acquire error: %s", exc)
+                yield f'event: error\ndata: {{"type":"error","error":{{"type":"api_error","message":"Internal error: {exc}"}}}}\n\n'
+                return
+
+            try:
                 _chunk_idx = 0
                 _got_429 = False
+                _got_auth_error = False
                 _buffered: list[str] = []
+                _429_DETECT_CHUNKS = 3  # 429/401/403 检测只需前 3 个 chunk
                 try:
                     async for chunk in stream_anthropic_sse(packet, model=req.model, access_token=_stream_access_token, estimated_input_tokens=_est_input):
                         # 内部元数据信号（不是 SSE 事件），不 yield 给客户端
                         if chunk.startswith("\x00"):
                             if "__QUOTA_LIMIT__" in chunk:
                                 _hit_quota = True
+                            elif "__CONV_ID__:" in chunk:
+                                _conv_id = chunk.split("__CONV_ID__:", 1)[1]
+                                STATE.conversation_id = _conv_id
+                            elif "__TASK_ID__:" in chunk:
+                                _task_id = chunk.split("__TASK_ID__:", 1)[1]
+                                if _task_id:
+                                    STATE.baseline_task_id = _task_id
                             continue
-                        # 检测前几个 chunk 是否有 429
-                        if _chunk_idx < 6:
+                        # 检测前几个 chunk 是否有 429 或 401/403
+                        if _chunk_idx < _429_DETECT_CHUNKS:
                             _buffered.append(chunk)
                             if "Bridge error: HTTP 429" in chunk:
                                 _got_429 = True
+                                break
+                            if "Bridge error: HTTP 401" in chunk or "Bridge error: HTTP 403" in chunk:
+                                _got_auth_error = True
                                 break
                             _chunk_idx += 1
                             continue
                         # flush buffer
                         if _buffered:
                             for buf in _buffered:
-                                # 解析 token 统计
                                 _input_tokens, _output_tokens = _extract_usage_from_chunk(
                                     buf, _input_tokens, _output_tokens
                                 )
@@ -836,7 +879,7 @@ async def anthropic_messages(request: Request) -> Any:
                         )
                         yield chunk
 
-                    if not _got_429:
+                    if not _got_429 and not _got_auth_error:
                         # flush 残余 buffer
                         for buf in _buffered:
                             _input_tokens, _output_tokens = _extract_usage_from_chunk(
@@ -858,6 +901,54 @@ async def anthropic_messages(request: Request) -> Any:
                             token_mgr.mark_account_exhausted(_stream_account_id)
                         return
 
+                    # ---- 401/403 → 标记账号吊销，自动换号重试一次 ----
+                    if _got_auth_error:
+                        logger.warning(
+                            "[Anthropic] stream 401/403 on account_id=%d, marking revoked and retrying with new account",
+                            _stream_account_id,
+                        )
+                        token_mgr.mark_account_revoked(_stream_account_id)
+                        # 尝试换号
+                        _new_account = selector.select_account(exclude_ids=_tried_ids)
+                        if _new_account:
+                            _tried_ids.add(_new_account["id"])
+                            _new_token = await token_mgr.get_valid_token(_new_account)
+                            if _new_token:
+                                _stream_account_id = _new_account["id"]
+                                _stream_access_token = _new_token
+                                _buffered.clear()
+                                logger.info("[Anthropic] 401/403 换号重试: new account_id=%d", _stream_account_id)
+                                # 用新 token 重试流
+                                async for chunk in stream_anthropic_sse(packet, model=req.model, access_token=_stream_access_token, estimated_input_tokens=_est_input):
+                                    if chunk.startswith("\x00"):
+                                        if "__QUOTA_LIMIT__" in chunk:
+                                            _hit_quota = True
+                                        elif "__CONV_ID__:" in chunk:
+                                            STATE.conversation_id = chunk.split("__CONV_ID__:", 1)[1]
+                                        elif "__TASK_ID__:" in chunk:
+                                            _tid = chunk.split("__TASK_ID__:", 1)[1]
+                                            if _tid:
+                                                STATE.baseline_task_id = _tid
+                                        continue
+                                    _input_tokens, _output_tokens = _extract_usage_from_chunk(
+                                        chunk, _input_tokens, _output_tokens
+                                    )
+                                    yield chunk
+                                # 重试成功
+                                total_tokens = _input_tokens + _output_tokens
+                                selector.record_usage(_stream_account_id, 1)
+                                safe_create_task(token_mgr.sync_account_quota(_stream_account_id, _stream_access_token))
+                                logger.info(
+                                    "[Anthropic] 401/403 retry stream done: account_id=%d input=%d output=%d total=%d",
+                                    _stream_account_id, _input_tokens, _output_tokens, total_tokens,
+                                )
+                                if _hit_quota:
+                                    token_mgr.mark_account_exhausted(_stream_account_id)
+                                return
+                        # 换号失败，返回错误
+                        yield 'event: error\ndata: {"type":"error","error":{"type":"authentication_error","message":"API key revoked (401/403), no fallback account available"}}\n\n'
+                        return
+
                     # 429 → 触发全局冷却，直接返回错误给 CC（不内部重试）
                     await _set_bridge_throttled()
                     token_mgr.mark_account_failed(_stream_account_id)
@@ -870,6 +961,9 @@ async def anthropic_messages(request: Request) -> Any:
                 except Exception as exc:
                     logger.error("[Anthropic] stream error: %s", exc)
                     raise
+            finally:
+                if _acquired:
+                    _BRIDGE_SEMAPHORE.release()
 
         return StreamingResponse(
             _stream_with_usage(),
@@ -917,8 +1011,28 @@ async def anthropic_messages(request: Request) -> Any:
             )
 
     if resp.status_code != 200:
-        detail = resp.text[:300]
-        raise HTTPException(status_code=resp.status_code, detail=f"Bridge error: HTTP {resp.status_code} {detail}")
+        # --- 401/403 吊销防御：标记账号，换号重试一次 ---
+        if resp.status_code in (401, 403):
+            logger.warning("[Anthropic] non-stream %d on account_id=%d, marking revoked", resp.status_code, account_id)
+            token_mgr.mark_account_revoked(account_id)
+            _new_account = selector.select_account(exclude_ids=_tried_ids)
+            if _new_account:
+                _tried_ids.add(_new_account["id"])
+                _new_token = await token_mgr.get_valid_token(_new_account)
+                if _new_token:
+                    logger.info("[Anthropic] non-stream 401/403 换号重试: new account_id=%d", _new_account["id"])
+                    req_body["access_token"] = _new_token
+                    try:
+                        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, read=180.0)) as client:
+                            resp = await client.post(bridge_url, json=req_body)
+                        if resp.status_code == 200:
+                            account_id = _new_account["id"]
+                            logger.info("[Anthropic] non-stream 401/403 retry succeeded with account_id=%d", account_id)
+                    except Exception as exc:
+                        raise HTTPException(status_code=502, detail=f"bridge_unreachable on auth retry: {exc}") from exc
+        if resp.status_code != 200:
+            detail = resp.text[:300]
+            raise HTTPException(status_code=resp.status_code, detail=f"Bridge error: HTTP {resp.status_code} {detail}")
 
     try:
         bridge_resp = resp.json()

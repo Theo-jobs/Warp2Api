@@ -256,6 +256,26 @@ class TokenManager:
             self._FAILURE_COOLDOWN,
         )
 
+    def mark_account_revoked(self, account_id: int) -> None:
+        """标记账号 API key 被吊销（401/403），设置 status='token_expired' 从选择池中剔除。"""
+        try:
+            with get_connection(str(self.db_path)) as conn:
+                now = datetime.now().isoformat()
+                conn.execute(
+                    "UPDATE accounts SET status = 'token_expired', updated_at = ? WHERE id = ?",
+                    (now, account_id),
+                )
+                conn.commit()
+            logger.warning(
+                "[TokenManager] account_id=%d API key 被吊销(401/403)，已标记为 token_expired",
+                account_id,
+            )
+        except Exception as exc:
+            logger.error(
+                "[TokenManager] account_id=%d 标记 token_expired 失败: %s",
+                account_id, exc,
+            )
+
     def mark_account_exhausted(self, account_id: int) -> None:
         """标记账号额度耗尽，设置 status='exhausted' 从选择池中剔除。"""
         try:
@@ -628,14 +648,14 @@ class TokenManager:
         策略：
         - exhausted（额度耗尽）：不刷新 token（省 Firebase 调用），用现有 token 查额度，token 也过期则跳过
         - token_expired（token 过期）：刷新 token + 查额度
-        - 每次后台循环都会调用，但只查 updated_at 距今 ≥4 小时的（刚耗尽的不查）
-        - 每次最多查 2 个（按 updated_at ASC，最久没检查的优先）
+        - 每次后台循环都会调用，但只查 updated_at 距今 ≥15 分钟的（刚耗尽的不查）
+        - 每次最多查 10 个（按 updated_at ASC，最久没检查的优先）
         - 查完更新 updated_at，下次循环自然轮到下一批
         """
         if self.is_firebase_blocked():
             return
 
-        min_age = time.time() - 1 * 3600  # 至少 1 小时前标记/检查的才查
+        min_age = time.time() - 15 * 60  # 至少 15 分钟前标记/检查的才查（原 1 小时 → 15 分钟）
 
         with get_connection(str(self.db_path)) as conn:
             conn.row_factory = sqlite3.Row
@@ -647,7 +667,7 @@ class TokenManager:
                      AND refresh_token IS NOT NULL AND refresh_token != ''
                      AND (updated_at IS NULL OR updated_at < ?)
                    ORDER BY updated_at ASC
-                   LIMIT 5""",
+                   LIMIT 10""",
                 (datetime.fromtimestamp(min_age).isoformat(),),
             ).fetchall()
 
@@ -736,7 +756,7 @@ class TokenManager:
                     self.set_firebase_blocked()
                     break
 
-            await asyncio.sleep(3)
+            await asyncio.sleep(1)  # 缩短间隔（原 3s → 1s），加速恢复检测
 
         if recovered > 0:
             logger.info("[TokenManager] exhausted 恢复检查完成，恢复 %d 个账号", recovered)

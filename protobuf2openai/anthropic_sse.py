@@ -264,9 +264,11 @@ def _process_warp_event(ev: dict, state: AnthropicSseState) -> list[str]:
 
     actions = _get(client_actions, "actions", "Actions") or []
     for action in actions:
+        _action_handled = False
         # ---- 文本内容 ----
         append_data = _get(action, "append_to_message_content", "appendToMessageContent")
         if isinstance(append_data, dict):
+            _action_handled = True
             message = append_data.get("message", {})
             agent_output = _get(message, "agent_output", "agentOutput") or {}
             text_content = agent_output.get("text", "")
@@ -283,6 +285,7 @@ def _process_warp_event(ev: dict, state: AnthropicSseState) -> list[str]:
         # ---- Tool call ----
         messages_data = _get(action, "add_messages_to_task", "addMessagesToTask")
         if isinstance(messages_data, dict):
+            _action_handled = True
             messages = messages_data.get("messages", [])
             for msg in messages:
                 # 优先检查 tool_call.call_mcp_tool（Warp protobuf 格式）
@@ -327,6 +330,11 @@ def _process_warp_event(ev: dict, state: AnthropicSseState) -> list[str]:
                             parts.append(_open_text_block(state))
                         parts.append(_emit_text_delta(state, text_content))
                         state.output_tokens += max(1, len(text_content) // 4)
+
+        # ---- 未识别的 action 类型：记录警告，防止内容静默丢失 ----
+        if not _action_handled:
+            _action_keys = list(action.keys()) if isinstance(action, dict) else type(action).__name__
+            logger.warning("[anthropic_sse] 未识别的 action 类型，内容可能丢失: keys=%s", _action_keys)
 
     return parts
 
@@ -429,6 +437,18 @@ async def stream_anthropic_sse(
                         except Exception:
                             pass
 
+                        # 提取 init 事件中的 conversation_id / task_id
+                        if "init" in event_data:
+                            init_data = event_data["init"]
+                            _conv_id = init_data.get("conversation_id", "")
+                            _task_id = init_data.get("task_id", "")
+                            if _conv_id:
+                                logger.info("[anthropic_sse] 会话初始化: conversation_id=%s task_id=%s", _conv_id, _task_id)
+                                yield f"\x00__CONV_ID__:{_conv_id}"
+                            if _task_id:
+                                yield f"\x00__TASK_ID__:{_task_id}"
+                            continue
+
                         # 检查错误事件
                         if isinstance(ev, dict) and ev.get("error"):
                             err_msg = str(ev["error"])
@@ -466,6 +486,11 @@ async def stream_anthropic_sse(
                             finished = event_data.get("finished")
                             if isinstance(finished, dict):
                                 _ingest_finished_usage(finished, state)
+                                _raw_reason = finished.get("reason")
+                                if _raw_reason:
+                                    logger.info("[anthropic_sse] finished reason: %s", _raw_reason)
+                            else:
+                                logger.warning("[anthropic_sse] finished 事件非 dict: %s", type(finished).__name__)
                             logger.info("[anthropic_sse] 收到 finished 事件，结束流")
                             break
 
@@ -479,6 +504,12 @@ async def stream_anthropic_sse(
                     state.output_tokens,
                     state.finish_reason,
                 )
+                # 低 output 告警：可能是流被异常截断
+                if state.output_tokens < 50 and _event_count > 5 and not state.has_tool_use:
+                    logger.warning(
+                        "[anthropic_sse] ⚠ 异常低输出: output_tokens=%d events=%d，可能存在内容丢失或后端截断",
+                        state.output_tokens, _event_count,
+                    )
                 for p in _finalize(state):
                     yield p
 

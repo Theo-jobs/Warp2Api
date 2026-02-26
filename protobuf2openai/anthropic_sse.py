@@ -331,13 +331,54 @@ def _process_warp_event(ev: dict, state: AnthropicSseState) -> list[str]:
                         parts.append(_emit_text_delta(state, text_content))
                         state.output_tokens += max(1, len(text_content) // 4)
 
-        # ---- Warp 内部控制事件（不含用户文本，安全忽略） ----
+        # ---- update_task_message（完整消息更新，包含响应文本） ----
+        # 与 warp2protobuf/warp/response.py 对齐：提取 message.agent_output.text
+        update_msg_data = _get(action, "update_task_message", "updateTaskMessage")
+        if isinstance(update_msg_data, dict):
+            _action_handled = True
+            _umsg = update_msg_data.get("message", {})
+            if isinstance(_umsg, dict):
+                _uagent = _get(_umsg, "agent_output", "agentOutput") or {}
+                _utext = _uagent.get("text", "") if isinstance(_uagent, dict) else ""
+                if _utext:
+                    logger.info("[anthropic_sse] update_task_message 提取文本 len=%d", len(_utext))
+                    if state.block_type == "tool_use":
+                        parts.append(_close_tool_use_block(state))
+                    if state.block_type != "text":
+                        parts.append(_open_text_block(state))
+                    parts.append(_emit_text_delta(state, _utext))
+                    state.output_tokens += max(1, len(_utext) // 4)
+
+        # ---- create_task（任务创建，可能包含初始消息文本） ----
+        # 与 warp2protobuf/warp/response.py 对齐：提取 task.messages[].agent_output.text
+        create_task_data = _get(action, "create_task", "createTask")
+        if isinstance(create_task_data, dict):
+            _action_handled = True
+            _ctask = create_task_data.get("task", {})
+            if isinstance(_ctask, dict):
+                for _cmsg in (_ctask.get("messages", []) or []):
+                    if isinstance(_cmsg, dict):
+                        _cagent = _get(_cmsg, "agent_output", "agentOutput") or {}
+                        _ctext = _cagent.get("text", "") if isinstance(_cagent, dict) else ""
+                        if _ctext:
+                            logger.info("[anthropic_sse] create_task 提取文本 len=%d", len(_ctext))
+                            if state.block_type == "tool_use":
+                                parts.append(_close_tool_use_block(state))
+                            if state.block_type != "text":
+                                parts.append(_open_text_block(state))
+                            parts.append(_emit_text_delta(state, _ctext))
+                            state.output_tokens += max(1, len(_ctext) // 4)
+
+        # ---- Warp 内部控制事件（纯状态管理，不含用户文本） ----
         _KNOWN_CONTROL_ACTIONS = {
             "commit_transaction", "commitTransaction",
             "update_task_description", "updateTaskDescription",
-            "update_task_message", "updateTaskMessage",
             "update_task_status", "updateTaskStatus",
+            "update_task_summary", "updateTaskSummary",
             "set_cursor_position", "setCursorPosition",
+            "begin_transaction", "beginTransaction",
+            "rollback_transaction", "rollbackTransaction",
+            "start_new_conversation", "startNewConversation",
         }
         if not _action_handled:
             _action_keys = set(action.keys()) if isinstance(action, dict) else set()

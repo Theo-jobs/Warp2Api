@@ -488,6 +488,30 @@ def _anthropic_nonstream_response_from_bridge(
                                 "input": args_obj,
                             })
 
+                # update_task_message: 与 warp2protobuf/warp/response.py 对齐
+                update_msg = action.get("update_task_message") or action.get("updateTaskMessage")
+                if isinstance(update_msg, dict):
+                    _umsg = update_msg.get("message", {})
+                    if isinstance(_umsg, dict):
+                        _uao = _umsg.get("agent_output") or _umsg.get("agentOutput") or {}
+                        if isinstance(_uao, dict):
+                            _ut = _uao.get("text")
+                            if isinstance(_ut, str) and _ut:
+                                text_parts.append(_ut)
+
+                # create_task: 与 warp2protobuf/warp/response.py 对齐
+                create_task_d = action.get("create_task") or action.get("createTask")
+                if isinstance(create_task_d, dict):
+                    _ctask = create_task_d.get("task", {})
+                    if isinstance(_ctask, dict):
+                        for _cmsg in (_ctask.get("messages", []) or []):
+                            if isinstance(_cmsg, dict):
+                                _cao = _cmsg.get("agent_output") or _cmsg.get("agentOutput") or {}
+                                if isinstance(_cao, dict):
+                                    _ct = _cao.get("text")
+                                    if isinstance(_ct, str) and _ct:
+                                        text_parts.append(_ct)
+
             finished = parsed.get("finished")
             if isinstance(finished, dict):
                 token_usage = finished.get("token_usage") or finished.get("tokenUsage") or []
